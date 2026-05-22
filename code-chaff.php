@@ -21,6 +21,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit; // Exit if accessed directly.
 }
 
+// Load DeepSeek connector.
+require_once __DIR__ . '/includes/class-deepseek-connector.php';
+
 	// --- CONSTANTS References ---
 	define( 'CODE_CHAFF_SETUP_DIR', __DIR__ );
 	define( 'CODE_CHAFF_SETUP_ROOT', __FILE__ );
@@ -96,17 +99,7 @@ class CodeChaff {
 	 * @return void
 	 */
 	public static function register_connector() {
-		if ( ! \function_exists( 'wp_register_connector' ) ) {
-			return;
-		}
-
-		\wp_register_connector(
-			'deepseek',
-			array(
-				'name'        => 'DeepSeek AI',
-				'description' => 'Provider for CodeChaff AI audits.',
-			)
-		);
+		DeepSeek_Connector::register();
 	}
 
 	/**
@@ -154,6 +147,15 @@ class CodeChaff {
 	 */
 	public static function has_action_scheduler() {
 		return \function_exists( 'as_enqueue_async_action' );
+	}
+
+	/**
+	 * Check if DeepSeek connector is configured with an API key.
+	 *
+	 * @return bool
+	 */
+	public static function is_deepseek_configured() {
+		return DeepSeek_Connector::is_configured();
 	}
 
 	/**
@@ -311,6 +313,11 @@ class CodeChaff {
 	public static function admin_init() {
 		$screen = get_current_screen();
 		if ( ! $screen || ! in_array( $screen->id, array( 'plugins', 'themes' ), true ) ) {
+			return;
+		}
+
+		// Only show AI Audit UI when DeepSeek is configured.
+		if ( ! self::is_deepseek_configured() ) {
 			return;
 		}
 
