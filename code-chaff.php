@@ -94,12 +94,13 @@ class CodeChaff {
 	}
 
 	/**
-	 * Register DeepSeek connector on Connectors screen.
+	 * Register DeepSeek connector using the modern Connectors API.
 	 *
+	 * @param \WP_Connector_Registry $registry The connector registry.
 	 * @return void
 	 */
-	public static function register_connector() {
-		DeepSeek_Connector::register();
+	public static function register_connector( $registry ) {
+		DeepSeek_Connector::register( $registry );
 	}
 
 	/**

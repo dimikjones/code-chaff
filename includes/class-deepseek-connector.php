@@ -24,30 +24,31 @@ class DeepSeek_Connector {
 	const ID = 'deepseek';
 
 	/**
-	 * Register the connector with the core Connectors API.
+	 * Register the connector using the modern Connectors API.
 	 *
+	 * @param \WP_Connector_Registry $registry The connector registry.
 	 * @return void
 	 */
-	public static function register() {
-		if ( ! \function_exists( 'wp_register_connector' ) ) {
+	public static function register( $registry ) {
+		if ( ! $registry || ! method_exists( $registry, 'register' ) ) {
 			return;
 		}
 
-		\wp_register_connector(
-			self::ID,
-			array(
-				'name'        => 'DeepSeek',
-				'description' => 'Text generation with DeepSeek models.',
-				'credentials' => array(
-					'api_key' => array(
-						'label'       => 'API Key',
-						'type'        => 'password',
-						'required'    => true,
-						'description' => 'Your DeepSeek API key from platform.deepseek.com',
-					),
-				),
-			)
+		$connector = array(
+			'name'           => 'DeepSeek',
+			'description'    => 'Text generation with DeepSeek models.',
+			'logo_url'       => '',
+			'type'           => 'ai_provider',
+			'authentication' => array(
+				'method'          => 'api_key',
+				'credentials_url' => 'https://platform.deepseek.com/api_keys',
+			),
+			'plugin'         => array(
+				'file' => 'code-chaff/code-chaff.php',
+			),
 		);
+
+		$registry->register( self::ID, $connector );
 	}
 
 	/**
