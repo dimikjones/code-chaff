@@ -134,6 +134,94 @@ class CodeChaff {
 			'message' => 'Audit job queued for background processing.',
 		);
 	}
+
+	/**
+	 * Check if Action Scheduler is available.
+	 *
+	 * @return bool True if Action Scheduler is active.
+	 */
+	public static function has_action_scheduler() {
+		return \function_exists( 'as_enqueue_async_action' );
+	}
+
+	/**
+	 * Queue an audit job for background processing.
+	 *
+	 * @param string $slug      Plugin or theme slug.
+	 * @param string $item_type 'plugin' or 'theme'.
+	 * @param string $old_ver   Currently installed version.
+	 * @param string $new_ver   Target update version.
+	 * @return int|bool Action ID or false on failure.
+	 */
+	public static function queue_audit_job( $slug, $item_type, $old_ver, $new_ver ) {
+		$args = array(
+			'slug'      => $slug,
+			'item_type' => $item_type,
+			'old_ver'   => $old_ver,
+			'new_ver'   => $new_ver,
+		);
+
+		if ( self::has_action_scheduler() ) {
+			return \as_enqueue_async_action( 'code_chaff_run_audit', $args );
+		}
+
+		// Fallback to WP-Cron.
+		return \wp_schedule_single_event( time() + 5, 'code_chaff_run_audit', array( $args ) );
+	}
+
+	/**
+	 * Fetch changed files manifest from WordPress.org Trac.
+	 *
+	 * @param string $slug      Item slug.
+	 * @param string $item_type 'plugin' or 'theme'.
+	 * @param string $old_ver   Old version.
+	 * @param string $new_ver   New version.
+	 * @return array List of changed .php and .js files.
+	 */
+	public static function fetch_changed_files( $slug, $item_type, $old_ver, $new_ver ) {
+		$base = ( 'plugin' === $item_type )
+			? 'https://plugins.trac.wordpress.org/log/'
+			: 'https://themes.trac.wordpress.org/log/';
+
+		$url = $base . $slug . '/?rev=' . $new_ver . '&mode=stop_on_copy&format=rss';
+
+		$response = \wp_remote_get( $url, array( 'timeout' => 15 ) );
+		if ( \is_wp_error( $response ) ) {
+			return array();
+		}
+
+		$body = \wp_remote_retrieve_body( $response );
+		// Very lightweight RSS parsing for file paths (real implementation would use XML parser).
+		preg_match_all( '/<title>([^<]+)<\/title>/', $body, $matches );
+
+		$files = array();
+		foreach ( $matches[1] as $title ) {
+			if ( preg_match( '/\.(php|js)$/', $title ) ) {
+				$files[] = $title;
+			}
+		}
+
+		return \array_unique( $files );
+	}
+
+	/**
+	 * Fetch raw file content from SVN tag.
+	 *
+	 * @param string $slug     Item slug.
+	 * @param string $version  Version tag.
+	 * @param string $file     Relative file path.
+	 * @return string Raw file contents or empty string on failure.
+	 */
+	public static function fetch_svn_file( $slug, $version, $file ) {
+		$url      = 'https://plugins.svn.wordpress.org/' . $slug . '/tags/' . $version . '/' . ltrim( $file, '/' );
+		$response = \wp_remote_get( $url, array( 'timeout' => 20 ) );
+
+		if ( \is_wp_error( $response ) ) {
+			return '';
+		}
+
+		return \wp_remote_retrieve_body( $response );
+	}
 }
 
 // Bootstrap hooks (outside class per WP standards).
