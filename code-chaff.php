@@ -290,10 +290,65 @@ class CodeChaff {
 			array( '%s', '%s', '%s', '%s', '%s', '%s', '%s' )
 		);
 	}
+
+	/**
+	 * Admin UI: enqueue scripts on updates screens.
+	 *
+	 * @return void
+	 */
+	public static function admin_init() {
+		$screen = get_current_screen();
+		if ( ! $screen || ! in_array( $screen->id, array( 'plugins', 'themes' ), true ) ) {
+			return;
+		}
+
+		wp_enqueue_script(
+			'code-chaff-admin',
+			CODE_CHAFF_SETUP_URL . 'assets/js/admin.js',
+			array( 'jquery' ),
+			CODE_CHAFF_SETUP_VERSION,
+			true
+		);
+
+		wp_localize_script(
+			'code-chaff-admin',
+			'CodeChaffAdmin',
+			array(
+				'ajaxUrl' => admin_url( 'admin-ajax.php' ),
+				'nonce'   => wp_create_nonce( 'code_chaff_audit' ),
+			)
+		);
+	}
+
+	/**
+	 * AJAX handler – queue audit job from update row button.
+	 *
+	 * @return void
+	 */
+	public static function ajax_queue_audit() {
+		check_ajax_referer( 'code_chaff_audit', 'nonce' );
+
+		$slug      = sanitize_text_field( wp_unslash( $_POST['slug'] ?? '' ) );
+		$item_type = sanitize_text_field( wp_unslash( $_POST['item_type'] ?? 'plugin' ) );
+		$old_ver   = sanitize_text_field( wp_unslash( $_POST['old_ver'] ?? '' ) );
+		$new_ver   = sanitize_text_field( wp_unslash( $_POST['new_ver'] ?? '' ) );
+
+		if ( ! $slug || ! $new_ver ) {
+			wp_send_json_error( 'Invalid request' );
+		}
+
+		$action_id = self::queue_audit_job( $slug, $item_type, $old_ver, $new_ver );
+
+		wp_send_json_success( array( 'action_id' => $action_id ) );
+	}
 }
 
 // Register the async action handler.
 add_action( 'code_chaff_run_audit', array( 'CodeChaff\CodeChaff', 'run_audit' ) );
+
+// Admin hooks.
+add_action( 'admin_enqueue_scripts', array( 'CodeChaff\CodeChaff', 'admin_init' ) );
+add_action( 'wp_ajax_code_chaff_queue_audit', array( 'CodeChaff\CodeChaff', 'ajax_queue_audit' ) );
 
 // Bootstrap hooks (outside class per WP standards).
 add_action( 'wp_connectors_init', array( 'CodeChaff\CodeChaff', 'register_connector' ) );
