@@ -222,7 +222,78 @@ class CodeChaff {
 
 		return \wp_remote_retrieve_body( $response );
 	}
+
+	/**
+	 * Execute the actual AI audit (called by async action).
+	 *
+	 * @param array $args Job arguments.
+	 * @return void
+	 */
+	public static function run_audit( $args ) {
+		$slug      = $args['slug'] ?? '';
+		$item_type = $args['item_type'] ?? 'plugin';
+		$old_ver   = $args['old_ver'] ?? '';
+		$new_ver   = $args['new_ver'] ?? '';
+
+		if ( ! $slug || ! $new_ver ) {
+			return;
+		}
+
+		$changed_files = self::fetch_changed_files( $slug, $item_type, $old_ver, $new_ver );
+
+		$report = array(
+			'security'    => array(),
+			'performance' => array(),
+		);
+
+		foreach ( $changed_files as $file ) {
+			$content = self::fetch_svn_file( $slug, $new_ver, $file );
+			if ( ! $content ) {
+				continue;
+			}
+
+			// Security prompt via native WP AI client.
+			$sec_prompt = 'Audit the following PHP/JS code for OWASP Top 10 issues, missing sanitization, escaping, and authentication checks. Return JSON only.';
+			$sec_result = \wp_ai_client_prompt( $sec_prompt . "\n\n" . $content );
+
+			// Performance prompt.
+			$perf_prompt = 'Analyze the code for unoptimized database queries, heavy loops, and missing caching. Return JSON only.';
+			$perf_result = \wp_ai_client_prompt( $perf_prompt . "\n\n" . $content );
+
+			$report['security'][ $file ]    = $sec_result;
+			$report['performance'][ $file ] = $perf_result;
+		}
+
+		// Simple risk classification.
+		$risk = 'secure';
+		if ( ! empty( $report['security'] ) ) {
+			$risk = 'warning';
+		}
+		if ( strpos( wp_json_encode( $report ), 'critical' ) !== false ) {
+			$risk = 'critical';
+		}
+
+		global $wpdb;
+		$table = $wpdb->prefix . 'code_chaff_audits';
+
+		$wpdb->insert(
+			$table,
+			array(
+				'slug'         => $slug,
+				'item_type'    => $item_type,
+				'old_version'  => $old_ver,
+				'new_version'  => $new_ver,
+				'risk_level'   => $risk,
+				'report'       => wp_json_encode( $report ),
+				'completed_at' => current_time( 'mysql' ),
+			),
+			array( '%s', '%s', '%s', '%s', '%s', '%s', '%s' )
+		);
+	}
 }
+
+// Register the async action handler.
+add_action( 'code_chaff_run_audit', array( 'CodeChaff\CodeChaff', 'run_audit' ) );
 
 // Bootstrap hooks (outside class per WP standards).
 add_action( 'wp_connectors_init', array( 'CodeChaff\CodeChaff', 'register_connector' ) );
