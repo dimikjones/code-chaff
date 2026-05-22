@@ -47,6 +47,18 @@ class CodeChaff {
 	 */
 	public static function activate() {
 		self::create_tables();
+
+		// Show a one-time admin notice on first activation.
+		set_transient( 'code_chaff_activated', true, 30 );
+	}
+
+	/**
+	 * Plugin deactivation handler.
+	 *
+	 * @return void
+	 */
+	public static function deactivate() {
+		// Placeholder for future cleanup (cron jobs, transients, etc.).
 	}
 
 	/**
@@ -354,3 +366,4 @@ add_action( 'wp_ajax_code_chaff_queue_audit', array( 'CodeChaff\CodeChaff', 'aja
 add_action( 'wp_connectors_init', array( 'CodeChaff\CodeChaff', 'register_connector' ) );
 add_action( 'init', array( 'CodeChaff\CodeChaff', 'register_ability' ) );
 register_activation_hook( \CODE_CHAFF_SETUP_ROOT, array( 'CodeChaff\CodeChaff', 'activate' ) );
+register_deactivation_hook( \CODE_CHAFF_SETUP_ROOT, array( 'CodeChaff\CodeChaff', 'deactivate' ) );
