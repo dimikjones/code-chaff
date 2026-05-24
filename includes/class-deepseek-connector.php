@@ -42,6 +42,9 @@ class DeepSeek_Connector {
 			'authentication' => array(
 				'method'          => 'api_key',
 				'credentials_url' => 'https://platform.deepseek.com/api_keys',
+				'setting_name'    => 'connectors_ai_deepseek_api_key',
+				'env_var_name'    => 'DEEPSEEK_API_KEY',
+				'constant_name'   => 'DEEPSEEK_API_KEY',
 			),
 			'plugin'         => array(
 				'file' => 'code-chaff/code-chaff.php',
@@ -57,12 +60,11 @@ class DeepSeek_Connector {
 	 * @return bool
 	 */
 	public static function is_configured() {
-		if ( ! \function_exists( 'wp_get_connector_credentials' ) ) {
-			return false;
-		}
+		
+		$api_key = self::get_api_key();
+		$has_key = ! empty( $api_key );
 
-		$credentials = \wp_get_connector_credentials( self::ID );
-		return ! empty( $credentials['api_key'] );
+		return $has_key;
 	}
 
 	/**
@@ -71,11 +73,28 @@ class DeepSeek_Connector {
 	 * @return string|false
 	 */
 	public static function get_api_key() {
-		if ( ! \function_exists( 'wp_get_connector_credentials' ) ) {
+
+		// Get the setting name from the connector registration.
+		$setting_name = self::get_setting_name();
+		if ( ! $setting_name ) {
 			return false;
 		}
+		
+		// Get the API key from WordPress options.
+		$api_key = get_option( $setting_name );
 
-		$credentials = \wp_get_connector_credentials( self::ID );
-		return $credentials['api_key'] ?? false;
+		return $api_key ? $api_key : false;
+	}
+
+	/**
+	 * Get the setting name for this connector.
+	 *
+	 * @return string|false
+	 */
+	private static function get_setting_name() {
+		// This should match the setting name used in the connector registration.
+		// Based on WordPress core patterns, it's typically formatted as:
+		// 'connectors_' . connector_id . '_api_key'
+		return 'connectors_ai_deepseek_api_key';
 	}
 }

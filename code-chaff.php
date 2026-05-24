@@ -21,8 +21,12 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit; // Exit if accessed directly.
 }
 
-// Load DeepSeek connector.
+// Load DeepSeek connector and provider classes.
 require_once __DIR__ . '/includes/class-deepseek-connector.php';
+require_once __DIR__ . '/includes/class-deepseek-provider.php';
+require_once __DIR__ . '/includes/class-deepseek-model.php';
+require_once __DIR__ . '/includes/class-deepseek-availability.php';
+require_once __DIR__ . '/includes/class-deepseek-model-metadata-directory.php';
 
 	// --- CONSTANTS References ---
 	define( 'CODE_CHAFF_SETUP_DIR', __DIR__ );
@@ -101,6 +105,40 @@ class CodeChaff {
 	 */
 	public static function register_connector( $registry ) {
 		DeepSeek_Connector::register( $registry );
+	}
+
+	/**
+	 * Register DeepSeek as an AI provider with the WP AI Client.
+	 * This enables auto-discovery of the connector by the Connectors API.
+	 *
+	 * @return void
+	 */
+	public static function register_ai_provider() {
+
+		// Check if WordPress AI Client classes exist.
+		if ( ! class_exists( '\WordPress\AiClient\AiClient' ) ) {
+			return;
+		}
+
+		if ( ! method_exists( '\WordPress\AiClient\AiClient', 'defaultRegistry' ) ) {
+			return;
+		}
+
+		$registry = \WordPress\AiClient\AiClient::defaultRegistry();
+
+		if ( ! $registry ) {
+			return;
+		}
+
+		if ( ! method_exists( $registry, 'registerProvider' ) ) {
+			return;
+		}
+
+		try {
+			$registry->registerProvider( '\CodeChaff\DeepSeek_Provider' );
+		} catch ( \Exception $e ) {
+			error_log( '[CodeChaff] Failed to register DeepSeek provider: ' . $e->getMessage() );
+		}
 	}
 
 	/**
@@ -369,6 +407,8 @@ add_action( 'code_chaff_run_audit', array( 'CodeChaff\CodeChaff', 'run_audit' ) 
 // Admin hooks.
 add_action( 'admin_enqueue_scripts', array( 'CodeChaff\CodeChaff', 'admin_init' ) );
 add_action( 'wp_ajax_code_chaff_queue_audit', array( 'CodeChaff\CodeChaff', 'ajax_queue_audit' ) );
+
+add_action( 'init', array( 'CodeChaff\CodeChaff', 'register_ai_provider' ) );
 
 // Bootstrap hooks (outside class per WP standards).
 add_action( 'wp_connectors_init', array( 'CodeChaff\CodeChaff', 'register_connector' ) );
