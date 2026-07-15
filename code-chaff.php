@@ -21,19 +21,15 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit; // Exit if accessed directly.
 }
 
-// Load DeepSeek connector and provider classes.
-require_once __DIR__ . '/includes/class-deepseek-connector.php';
-require_once __DIR__ . '/includes/class-deepseek-provider.php';
-require_once __DIR__ . '/includes/class-deepseek-model.php';
-require_once __DIR__ . '/includes/class-deepseek-availability.php';
-require_once __DIR__ . '/includes/class-deepseek-model-metadata-directory.php';
+// Load settings class.
+require_once __DIR__ . '/includes/class-code-chaff-settings.php';
 
-	// --- CONSTANTS References ---
-	define( 'CODE_CHAFF_SETUP_DIR', __DIR__ );
-	define( 'CODE_CHAFF_SETUP_ROOT', __FILE__ );
-	define( 'CODE_CHAFF_SETUP_URL', plugin_dir_url( __FILE__ ) );
-	define( 'CODE_CHAFF_SETUP_CACHE_TIME_DAY', DAY_IN_SECONDS );
-	define( 'CODE_CHAFF_SETUP_VERSION', '0.1.0' );
+// --- CONSTANTS References ---
+define( 'CODE_CHAFF_SETUP_DIR', __DIR__ );
+define( 'CODE_CHAFF_SETUP_ROOT', __FILE__ );
+define( 'CODE_CHAFF_SETUP_URL', plugin_dir_url( __FILE__ ) );
+define( 'CODE_CHAFF_SETUP_CACHE_TIME_DAY', DAY_IN_SECONDS );
+define( 'CODE_CHAFF_SETUP_VERSION', '0.1.0' );
 
 /**
  * Main plugin class (all static per coding standards).
@@ -98,50 +94,6 @@ class CodeChaff {
 	}
 
 	/**
-	 * Register DeepSeek connector using the modern Connectors API.
-	 *
-	 * @param \WP_Connector_Registry $registry The connector registry.
-	 * @return void
-	 */
-	public static function register_connector( $registry ) {
-		DeepSeek_Connector::register( $registry );
-	}
-
-	/**
-	 * Register DeepSeek as an AI provider with the WP AI Client.
-	 * This enables auto-discovery of the connector by the Connectors API.
-	 *
-	 * @return void
-	 */
-	public static function register_ai_provider() {
-
-		// Check if WordPress AI Client classes exist.
-		if ( ! class_exists( '\WordPress\AiClient\AiClient' ) ) {
-			return;
-		}
-
-		if ( ! method_exists( '\WordPress\AiClient\AiClient', 'defaultRegistry' ) ) {
-			return;
-		}
-
-		$registry = \WordPress\AiClient\AiClient::defaultRegistry();
-
-		if ( ! $registry ) {
-			return;
-		}
-
-		if ( ! method_exists( $registry, 'registerProvider' ) ) {
-			return;
-		}
-
-		try {
-			$registry->registerProvider( '\CodeChaff\DeepSeek_Provider' );
-		} catch ( \Exception $e ) {
-			error_log( '[CodeChaff] Failed to register DeepSeek provider: ' . $e->getMessage() );
-		}
-	}
-
-	/**
 	 * Register the audit ability for MCP/Abilities API.
 	 *
 	 * @return void
@@ -189,12 +141,85 @@ class CodeChaff {
 	}
 
 	/**
-	 * Check if DeepSeek connector is configured with an API key.
+	 * Get all available AI providers from the WP AI Client registry.
+	 *
+	 * @return array Associative array of provider_id => provider_name.
+	 */
+	public static function get_available_providers() {
+		$providers = array();
+
+		if ( ! class_exists( '\WordPress\AiClient\AiClient' ) ) {
+			return $providers;
+		}
+
+		if ( ! method_exists( '\WordPress\AiClient\AiClient', 'defaultRegistry' ) ) {
+			return $providers;
+		}
+
+		$registry = \WordPress\AiClient\AiClient::defaultRegistry();
+
+		if ( ! $registry || ! method_exists( $registry, 'getProviders' ) ) {
+			return $providers;
+		}
+
+		try {
+			$registered = $registry->getProviders();
+			foreach ( $registered as $provider ) {
+				if ( is_object( $provider ) ) {
+					if ( method_exists( $provider, 'getMetadata' ) ) {
+						$metadata = $provider->getMetadata();
+						if ( is_object( $metadata ) && method_exists( $metadata, 'getId' ) ) {
+							$providers[ $metadata->getId() ] = method_exists( $metadata, 'getName' ) ? $metadata->getName() : $metadata->getId();
+						}
+					} elseif ( method_exists( $provider, 'getId' ) && method_exists( $provider, 'getName' ) ) {
+						$providers[ $provider->getId() ] = $provider->getName();
+					}
+				} elseif ( is_string( $provider ) && class_exists( $provider ) ) {
+					$id   = $provider;
+					$name = $provider;
+					if ( method_exists( $provider, 'getMetadata' ) ) {
+						$metadata = $provider::getMetadata();
+						if ( is_object( $metadata ) && method_exists( $metadata, 'getId' ) ) {
+							$id   = $metadata->getId();
+							$name = method_exists( $metadata, 'getName' ) ? $metadata->getName() : $id;
+						}
+					}
+					$providers[ $id ] = $name;
+				}
+			}
+		} catch ( \Exception $e ) {
+			error_log( '[CodeChaff] Error retrieving AI providers: ' . $e->getMessage() );
+		}
+
+		return $providers;
+	}
+
+	/**
+	 * Get the currently selected AI provider.
+	 *
+	 * @return string Provider ID or empty string.
+	 */
+	public static function get_selected_provider() {
+		return get_option( CodeChaff_Settings::OPTION_NAME, '' );
+	}
+
+	/**
+	 * Check if an AI provider is configured and available.
 	 *
 	 * @return bool
 	 */
-	public static function is_deepseek_configured() {
-		return DeepSeek_Connector::is_configured();
+	public static function is_ai_configured() {
+		$selected_provider = self::get_selected_provider();
+
+		// If no provider is selected, check if any provider is available.
+		if ( empty( $selected_provider ) ) {
+			$available = self::get_available_providers();
+			return ! empty( $available );
+		}
+
+		// Check if the selected provider is in the available list.
+		$available = self::get_available_providers();
+		return isset( $available[ $selected_provider ] );
 	}
 
 	/**
@@ -355,8 +380,8 @@ class CodeChaff {
 			return;
 		}
 
-		// Only show AI Audit UI when DeepSeek is configured.
-		if ( ! self::is_deepseek_configured() ) {
+		// Only show AI Audit UI when an AI provider is configured.
+		if ( ! self::is_ai_configured() ) {
 			return;
 		}
 
@@ -408,10 +433,11 @@ add_action( 'code_chaff_run_audit', array( 'CodeChaff\CodeChaff', 'run_audit' ) 
 add_action( 'admin_enqueue_scripts', array( 'CodeChaff\CodeChaff', 'admin_init' ) );
 add_action( 'wp_ajax_code_chaff_queue_audit', array( 'CodeChaff\CodeChaff', 'ajax_queue_audit' ) );
 
-add_action( 'init', array( 'CodeChaff\CodeChaff', 'register_ai_provider' ) );
+// Register settings page.
+CodeChaff_Settings::init();
 
-// Bootstrap hooks (outside class per WP standards).
-add_action( 'wp_connectors_init', array( 'CodeChaff\CodeChaff', 'register_connector' ) );
+// Bootstrap abilities.
 add_action( 'init', array( 'CodeChaff\CodeChaff', 'register_ability' ) );
+
 register_activation_hook( \CODE_CHAFF_SETUP_ROOT, array( 'CodeChaff\CodeChaff', 'activate' ) );
 register_deactivation_hook( \CODE_CHAFF_SETUP_ROOT, array( 'CodeChaff\CodeChaff', 'deactivate' ) );
