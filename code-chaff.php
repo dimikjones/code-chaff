@@ -44,6 +44,13 @@ class CodeChaff {
 	const SETUP_VERSION  = \CODE_CHAFF_SETUP_VERSION;
 
 	/**
+	 * Collected AI connectors from the Connectors API.
+	 *
+	 * @var array
+	 */
+	private static $ai_connectors = array();
+
+	/**
 	 * Plugin activation handler.
 	 *
 	 * @return void
@@ -141,54 +148,127 @@ class CodeChaff {
 	}
 
 	/**
-	 * Get all available AI providers from the WP AI Client registry.
+	 * Collect AI providers from the Connectors API registry.
+	 *
+	 * @param mixed $registry The connector registry.
+	 * @return void
+	 */
+	public static function collect_ai_connectors( $registry ) {
+		if ( ! $registry ) {
+			return;
+		}
+
+		$connectors = array();
+
+		// Try different methods to get all registered connectors.
+		if ( method_exists( $registry, 'get_all' ) ) {
+			$connectors = $registry->get_all();
+		} elseif ( method_exists( $registry, 'get_all_registered' ) ) {
+			$connectors = $registry->get_all_registered();
+		} elseif ( method_exists( $registry, 'get_connectors' ) ) {
+			$connectors = $registry->get_connectors();
+		} elseif ( isset( $registry->registered ) ) {
+			$connectors = $registry->registered;
+		} elseif ( isset( $registry->connectors ) ) {
+			$connectors = $registry->connectors;
+		}
+
+		// If methods failed, try object properties (public, protected, private).
+		if ( empty( $connectors ) ) {
+			$vars = get_object_vars( $registry );
+			foreach ( $vars as $value ) {
+				if ( is_array( $value ) && ! empty( $value ) ) {
+					$first = reset( $value );
+					if ( is_array( $first ) && isset( $first['type'] ) ) {
+						$connectors = $value;
+						break;
+					}
+				}
+			}
+		}
+
+		// If still empty, use reflection to inspect all properties.
+		if ( empty( $connectors ) ) {
+			try {
+				$reflection = new \ReflectionClass( $registry );
+				foreach ( $reflection->getProperties() as $property ) {
+					$property->setAccessible( true );
+					$value = $property->getValue( $registry );
+					if ( is_array( $value ) && ! empty( $value ) ) {
+						$first = reset( $value );
+						if ( is_array( $first ) && isset( $first['type'] ) ) {
+							$connectors = $value;
+							break;
+						}
+					}
+				}
+			} catch ( \Exception $e ) {
+				$ignore = true; // Reflection failed, ignore.
+			}
+		}
+
+		foreach ( $connectors as $id => $connector ) {
+			if ( is_array( $connector ) && isset( $connector['type'] ) && 'ai_provider' === $connector['type'] ) {
+				self::$ai_connectors[ $id ] = $connector['name'] ?? $id;
+			}
+		}
+	}
+
+	/**
+	 * Get all available AI providers from the WP AI Client registry or Connectors API.
 	 *
 	 * @return array Associative array of provider_id => provider_name.
 	 */
 	public static function get_available_providers() {
 		$providers = array();
 
-		if ( ! class_exists( '\WordPress\AiClient\AiClient' ) ) {
-			return $providers;
-		}
-
-		if ( ! method_exists( '\WordPress\AiClient\AiClient', 'defaultRegistry' ) ) {
-			return $providers;
-		}
-
-		$registry = \WordPress\AiClient\AiClient::defaultRegistry();
-
-		if ( ! $registry || ! method_exists( $registry, 'getProviders' ) ) {
-			return $providers;
-		}
-
-		try {
-			$registered = $registry->getProviders();
-			foreach ( $registered as $provider ) {
-				if ( is_object( $provider ) ) {
-					if ( method_exists( $provider, 'getMetadata' ) ) {
-						$metadata = $provider->getMetadata();
-						if ( is_object( $metadata ) && method_exists( $metadata, 'getId' ) ) {
-							$providers[ $metadata->getId() ] = method_exists( $metadata, 'getName' ) ? $metadata->getName() : $metadata->getId();
-						}
-					} elseif ( method_exists( $provider, 'getId' ) && method_exists( $provider, 'getName' ) ) {
-						$providers[ $provider->getId() ] = $provider->getName();
-					}
-				} elseif ( is_string( $provider ) && class_exists( $provider ) ) {
-					$id   = $provider;
-					$name = $provider;
-					if ( method_exists( $provider, 'getMetadata' ) ) {
-						$metadata = $provider::getMetadata();
-						if ( is_object( $metadata ) && method_exists( $metadata, 'getId' ) ) {
-							$id   = $metadata->getId();
-							$name = method_exists( $metadata, 'getName' ) ? $metadata->getName() : $id;
+		// Try WP AI Client registry first.
+		if ( class_exists( '\WordPress\AiClient\AiClient' ) && method_exists( '\WordPress\AiClient\AiClient', 'defaultRegistry' ) ) {
+			$registry = \WordPress\AiClient\AiClient::defaultRegistry();
+			if ( $registry && method_exists( $registry, 'getProviders' ) ) {
+				try {
+					$registered = $registry->getProviders();
+					foreach ( $registered as $provider ) {
+						if ( is_object( $provider ) ) {
+							if ( method_exists( $provider, 'getMetadata' ) ) {
+								$metadata = $provider->getMetadata();
+								if ( is_object( $metadata ) && method_exists( $metadata, 'getId' ) ) {
+									$providers[ $metadata->getId() ] = method_exists( $metadata, 'getName' ) ? $metadata->getName() : $metadata->getId();
+								}
+							} elseif ( method_exists( $provider, 'getId' ) && method_exists( $provider, 'getName' ) ) {
+								$providers[ $provider->getId() ] = $provider->getName();
+							}
+						} elseif ( is_string( $provider ) && class_exists( $provider ) ) {
+							$id   = $provider;
+							$name = $provider;
+							if ( method_exists( $provider, 'getMetadata' ) ) {
+								$metadata = $provider::getMetadata();
+								if ( is_object( $metadata ) && method_exists( $metadata, 'getId' ) ) {
+									$id   = $metadata->getId();
+									$name = method_exists( $metadata, 'getName' ) ? $metadata->getName() : $id;
+								}
+							}
+							$providers[ $id ] = $name;
 						}
 					}
-					$providers[ $id ] = $name;
+				} catch ( \Exception $e ) {
+					error_log( '[CodeChaff] Error retrieving AI providers from WP AI Client: ' . $e->getMessage() );
 				}
 			}
-		} catch ( \Exception $e ) {
-			error_log( '[CodeChaff] Error retrieving AI providers: ' . $e->getMessage() );
+		}
+
+		// If WP AI Client registry is empty, fall back to Connectors API.
+		if ( empty( $providers ) && ! empty( self::$ai_connectors ) ) {
+			$providers = self::$ai_connectors;
+		}
+
+		// Direct fallback: check for known provider classes that are configured.
+		if ( empty( $providers ) ) {
+			if ( class_exists( '\DeepSeekWpProvider\DeepSeek_Connector' ) && method_exists( '\DeepSeekWpProvider\DeepSeek_Connector', 'is_configured' ) ) {
+				if ( \DeepSeekWpProvider\DeepSeek_Connector::is_configured() ) {
+					$providers['deepseek'] = 'DeepSeek';
+				}
+			}
 		}
 
 		return $providers;
@@ -432,6 +512,9 @@ add_action( 'code_chaff_run_audit', array( 'CodeChaff\CodeChaff', 'run_audit' ) 
 // Admin hooks.
 add_action( 'admin_enqueue_scripts', array( 'CodeChaff\CodeChaff', 'admin_init' ) );
 add_action( 'wp_ajax_code_chaff_queue_audit', array( 'CodeChaff\CodeChaff', 'ajax_queue_audit' ) );
+
+// Collect AI connectors from the Connectors API.
+add_action( 'wp_connectors_init', array( 'CodeChaff\CodeChaff', 'collect_ai_connectors' ), 100 );
 
 // Register settings page.
 CodeChaff_Settings::init();
