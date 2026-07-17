@@ -36,6 +36,13 @@ define( 'CODE_CHAFF_SETUP_VERSION', '0.1.0' );
 class CodeChaff {
 
 	/**
+	 * In-memory cache for is_wordpress_org_plugin() results.
+	 *
+	 * @var array
+	 */
+	private static $org_plugin_cache = array();
+
+	/**
 	 * Plugin activation handler.
 	 *
 	 * @return void
@@ -242,6 +249,86 @@ class CodeChaff {
 	 */
 	public static function get_selected_provider() {
 		return get_option( CodeChaff_Settings::OPTION_NAME, '' );
+	}
+
+	/**
+	 * Determine whether a plugin is hosted on WordPress.org.
+	 *
+	 * Checks three indicators in order (short-circuits on first match):
+	 * 1. Absence of an UpdateURI header (third-party plugins define this).
+	 * 2. Presence in the update_plugins transient (only .org plugins appear here).
+	 * 3. HTTP HEAD check on the plugin's SVN directory on WordPress.org.
+	 *
+	 * Results are cached per-request in a static array.
+	 *
+	 * @param string $plugin_file Main plugin file path (e.g. 'akismet/akismet.php').
+	 * @return bool True if the plugin appears to be hosted on WordPress.org.
+	 */
+	public static function is_wordpress_org_plugin( $plugin_file ) {
+		if ( isset( self::$org_plugin_cache[ $plugin_file ] ) ) {
+			return self::$org_plugin_cache[ $plugin_file ];
+		}
+
+		if ( ! function_exists( 'get_plugin_data' ) ) {
+			require_once ABSPATH . 'wp-admin/includes/plugin.php';
+		}
+
+		$plugin_data = get_plugin_data( WP_PLUGIN_DIR . '/' . $plugin_file, false, false );
+
+		// Check 1: Third-party plugins define UpdateURI for their own update server.
+		if ( ! empty( $plugin_data['UpdateURI'] ) ) {
+			self::$org_plugin_cache[ $plugin_file ] = false;
+			return false;
+		}
+
+		// Check 2: Look in the update_plugins transient for .org update data.
+		$updates = get_site_transient( 'update_plugins' );
+		if ( is_object( $updates ) && ! empty( $updates->response ) ) {
+			if ( isset( $updates->response[ $plugin_file ] ) ) {
+				self::$org_plugin_cache[ $plugin_file ] = true;
+				return true;
+			}
+		}
+
+		// Check 3: HTTP HEAD to the plugin's SVN directory on .org.
+		$slug        = dirname( $plugin_file );
+		$slug        = ( '.' === $slug ) ? basename( $plugin_file, '.php' ) : $slug;
+		$svn_url     = 'https://plugins.svn.wordpress.org/' . $slug . '/';
+		$response    = \wp_remote_head( $svn_url, array( 'timeout' => 10 ) );
+		$is_dot_org  = false;
+
+		if ( ! \is_wp_error( $response ) && 200 === \wp_remote_retrieve_response_code( $response ) ) {
+			$is_dot_org = true;
+		}
+
+		self::$org_plugin_cache[ $plugin_file ] = $is_dot_org;
+		return $is_dot_org;
+	}
+
+	/**
+	 * Determine whether a plugin slug belongs to a WordPress.org hosted plugin.
+	 *
+	 * Resolves a slug to its main plugin file and delegates to is_wordpress_org_plugin().
+	 * Returns false if the slug cannot be resolved to an active plugin.
+	 *
+	 * @param string $slug Plugin slug.
+	 * @return bool True if the plugin is hosted on WordPress.org.
+	 */
+	public static function is_wordpress_org_plugin_by_slug( $slug ) {
+		if ( ! function_exists( 'get_plugins' ) ) {
+			require_once ABSPATH . 'wp-admin/includes/plugin.php';
+		}
+
+		$plugins = get_plugins();
+		foreach ( $plugins as $plugin_file => $plugin_data ) {
+			$plugin_slug = dirname( $plugin_file );
+			$plugin_slug = ( '.' === $plugin_slug ) ? basename( $plugin_file, '.php' ) : $plugin_slug;
+			if ( $plugin_slug === $slug ) {
+				return self::is_wordpress_org_plugin( $plugin_file );
+			}
+		}
+
+		return false;
 	}
 
 	/**
@@ -963,6 +1050,10 @@ class CodeChaff {
 			return;
 		}
 
+		$slug_map       = self::get_plugin_slugs_map( true );
+		$version_map    = self::get_plugin_versions_map( true );
+		$theme_versions = self::get_theme_versions_map();
+
 		wp_enqueue_script(
 			'code-chaff-admin',
 			CODE_CHAFF_SETUP_URL . 'assets/js/admin.js',
@@ -977,9 +1068,9 @@ class CodeChaff {
 			array(
 				'ajaxUrl'        => admin_url( 'admin-ajax.php' ),
 				'nonce'          => wp_create_nonce( 'code_chaff_audit' ),
-				'pluginSlugs'    => self::get_plugin_slugs_map(),
-				'pluginVersions' => self::get_plugin_versions_map(),
-				'themeVersions'  => self::get_theme_versions_map(),
+				'pluginSlugs'    => $slug_map,
+				'pluginVersions' => $version_map,
+				'themeVersions'  => $theme_versions,
 			)
 		);
 	}
@@ -987,9 +1078,10 @@ class CodeChaff {
 	/**
 	 * Build a map of plugin file => slug for the admin JS.
 	 *
+	 * @param bool $org_only If true, only include WordPress.org hosted plugins.
 	 * @return array
 	 */
-	private static function get_plugin_slugs_map() {
+	private static function get_plugin_slugs_map( $org_only = false ) {
 		if ( ! function_exists( 'get_plugins' ) ) {
 			require_once ABSPATH . 'wp-admin/includes/plugin.php';
 		}
@@ -998,6 +1090,9 @@ class CodeChaff {
 		$map     = array();
 
 		foreach ( $plugins as $plugin_file => $plugin_data ) {
+			if ( $org_only && ! self::is_wordpress_org_plugin( $plugin_file ) ) {
+				continue;
+			}
 			$slug                = dirname( $plugin_file );
 			$map[ $plugin_file ] = ( '.' === $slug ) ? basename( $plugin_file, '.php' ) : $slug;
 		}
@@ -1008,9 +1103,10 @@ class CodeChaff {
 	/**
 	 * Build a map of plugin slug => installed version.
 	 *
+	 * @param bool $org_only If true, only include WordPress.org hosted plugins.
 	 * @return array
 	 */
-	private static function get_plugin_versions_map() {
+	private static function get_plugin_versions_map( $org_only = false ) {
 		if ( ! function_exists( 'get_plugins' ) ) {
 			require_once ABSPATH . 'wp-admin/includes/plugin.php';
 		}
@@ -1019,6 +1115,9 @@ class CodeChaff {
 		$map     = array();
 
 		foreach ( $plugins as $plugin_file => $plugin_data ) {
+			if ( $org_only && ! self::is_wordpress_org_plugin( $plugin_file ) ) {
+				continue;
+			}
 			$slug         = dirname( $plugin_file );
 			$slug         = ( '.' === $slug ) ? basename( $plugin_file, '.php' ) : $slug;
 			$map[ $slug ] = $plugin_data['Version'] ?? '';
@@ -1062,6 +1161,13 @@ class CodeChaff {
 
 		if ( ! $slug || ! $new_ver ) {
 			wp_send_json_error( __( 'Invalid request: missing slug or version.', 'code-chaff' ) );
+		}
+
+		// Server-side guard: plugins must be hosted on WordPress.org.
+		if ( 'plugin' === $item_type && ! self::is_wordpress_org_plugin_by_slug( $slug ) ) {
+			wp_send_json_error(
+				__( 'AI Audit is only available for plugins hosted on WordPress.org. Premium and third-party plugins are not supported yet.', 'code-chaff' )
+			);
 		}
 
 		$action_id = self::queue_audit_job( $slug, $item_type, $old_ver, $new_ver );

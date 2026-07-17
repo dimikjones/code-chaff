@@ -9,8 +9,7 @@
 	$( function() {
 		/**
 		 * Extract the new version from WordPress update notice text.
-		 * The update notice typically contains text like:
-		 * "There is a new version of Akismet available. View version 5.3.1 details."
+		 * Matches "version 5.7" or "Version 5.7".
 		 *
 		 * @param {string} text The update notice text.
 		 * @return {string} The version number, or empty string.
@@ -21,59 +20,81 @@
 		}
 
 		/**
-		 * Get the currently installed version of a plugin or theme.
-		 * Uses wp.updates if available, otherwise falls back to DOM parsing.
+		 * Get the currently installed version of a plugin.
 		 *
-		 * @param {Object} $row The jQuery row element.
-		 * @param {string} slug The plugin/theme slug.
-		 * @param {string} itemType 'plugin' or 'theme'.
+		 * @param {string} slug The plugin slug.
 		 * @return {string} The installed version, or empty string.
 		 */
-		function getInstalledVersion( $row, slug, itemType ) {
-			// Try wp.updates API for plugins (built into WordPress core).
-			if ( 'plugin' === itemType && wp.updates && wp.updates.plugins && wp.updates.plugins[ slug ] ) {
-				return wp.updates.plugins[ slug ].version || '';
-			}
-
-			// Try wp.updates for themes.
-			if ( 'theme' === itemType && wp.updates && wp.updates.themes && wp.updates.themes[ slug ] ) {
-				return wp.updates.themes[ slug ].version || '';
-			}
-
-			// Fallback: parse from DOM — plugin version is in the plugin description column.
-			const $versionCol = $row.find( 'td.plugin-version, td.column-version' );
-			if ( $versionCol.length ) {
-				const versionText = $versionCol.text().trim();
-				const match = versionText.match( /([\d.]+)/ );
-				if ( match ) {
-					return match[1];
-				}
-			}
-
-			// Fallback: use data injected via wp_localize_script (if available).
+		function getInstalledVersion( slug ) {
 			if ( CodeChaffAdmin.pluginVersions && CodeChaffAdmin.pluginVersions[ slug ] ) {
 				return CodeChaffAdmin.pluginVersions[ slug ];
 			}
-			if ( CodeChaffAdmin.themeVersions && CodeChaffAdmin.themeVersions[ slug ] ) {
-				return CodeChaffAdmin.themeVersions[ slug ];
+			return '';
+		}
+
+		/**
+		 * Find the new version available for a plugin by checking the
+		 * accompanying plugin-update-tr row that WordPress inserts below
+		 * the main plugin row.
+		 *
+		 * @param {Object} $row The plugin's <tr> row element.
+		 * @param {string} slug The plugin slug.
+		 * @return {string} The new version, or empty string.
+		 */
+		function findNewVersion( $row, slug ) {
+			// 1. Check the companion update row (tr.plugin-update-tr).
+			const pluginFile  = $row.data( 'plugin' );
+			const $updateRows = $( '.plugin-update-tr' );
+
+			for ( let i = 0; i < $updateRows.length; i++ ) {
+				const $updateRow = $updateRows.eq( i );
+				if ( $updateRow.data( 'plugin' ) === pluginFile ) {
+					const ver = extractNewVersion( $updateRow.text() );
+					if ( ver ) {
+						return ver;
+					}
+				}
+			}
+
+			// 2. Fallback: check any element containing "version" text in context
+			// of this plugin slug.
+			const $allUpdateMsgs = $( '.update-message, .plugin-update-message, .notice' );
+			for ( let i = 0; i < $allUpdateMsgs.length; i++ ) {
+				const $el = $allUpdateMsgs.eq( i );
+				const text = $el.text();
+				if ( text.toLowerCase().indexOf( slug.toLowerCase() ) !== -1 ) {
+					const ver = extractNewVersion( text );
+					if ( ver ) {
+						return ver;
+					}
+				}
 			}
 
 			return '';
 		}
 
-		// Add AI Audit button to plugin update rows.
-		$( '.plugins tr.active[data-plugin] .plugin-update-message, ' +
-		   '.plugins tr.active[data-plugin] .update-message' ).each( function() {
-			const $row    = $( this ).closest( 'tr' );
-			const $msg    = $( this );
-			const slug    = CodeChaffAdmin.pluginSlugs && CodeChaffAdmin.pluginSlugs[ $row.data( 'plugin' ) ]
-				? CodeChaffAdmin.pluginSlugs[ $row.data( 'plugin' ) ]
-				: $row.data( 'plugin' );
-			const newVer  = extractNewVersion( $msg.text() );
-			const oldVer  = getInstalledVersion( $row, slug, 'plugin' );
+		// --- Plugin rows ---
+		// Target any tr with data-plugin AND the 'update' class (both active and inactive).
+		$( '.plugins tr[data-plugin].update' ).each( function() {
+			const $row       = $( this );
+			const pluginFile = $row.data( 'plugin' );
+			const slug       = $row.data( 'slug' )
+				|| ( CodeChaffAdmin.pluginSlugs && CodeChaffAdmin.pluginSlugs[ pluginFile ] )
+				|| pluginFile;
+			const newVer     = findNewVersion( $row, slug );
+			const oldVer     = getInstalledVersion( slug );
 
-			if ( ! newVer ) {
+			if ( ! slug || ! newVer ) {
 				return;
+			}
+
+			// Determine the best element to append the button to.
+			let $target = $row.find( '.plugin-update-message, .update-message' ).first();
+			if ( ! $target.length ) {
+				$target = $row.find( '.plugin-version-author-uri' ).first();
+			}
+			if ( ! $target.length ) {
+				$target = $row.find( '.column-description' ).first();
 			}
 
 			const $btn = $( '<button>', {
@@ -85,16 +106,15 @@
 				'data-new-ver': newVer
 			} );
 
-			$msg.append( ' &nbsp; ' ).append( $btn );
+			$target.append( ' &nbsp; ' ).append( $btn );
 		} );
 
-		// Add AI Audit button to theme update rows on themes.php and update-core.php.
+		// --- Theme rows ---
 		$( '.themes .update-message, .theme-browser .theme .update-message, #update-themes-table .update-message' ).each( function() {
 			const $msg     = $( this );
 			const $themeEl = $msg.closest( '.theme, tr' );
 			let slug       = $themeEl.data( 'slug' ) || $themeEl.attr( 'id' );
 
-			// Try to extract slug from theme name or update notice.
 			if ( ! slug ) {
 				const idAttr = $themeEl.attr( 'id' );
 				if ( idAttr ) {
@@ -103,7 +123,9 @@
 			}
 
 			const newVer = extractNewVersion( $msg.text() );
-			const oldVer = getInstalledVersion( $themeEl, slug, 'theme' );
+			const oldVer = CodeChaffAdmin.themeVersions && CodeChaffAdmin.themeVersions[ slug ]
+				? CodeChaffAdmin.themeVersions[ slug ]
+				: '';
 
 			if ( ! slug || ! newVer ) {
 				return;
