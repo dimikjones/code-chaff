@@ -24,24 +24,16 @@ if ( ! defined( 'ABSPATH' ) ) {
 // Load settings class.
 require_once __DIR__ . '/includes/class-code-chaff-settings.php';
 
-// --- CONSTANTS References ---
+// --- CONSTANTS ---
 define( 'CODE_CHAFF_SETUP_DIR', __DIR__ );
 define( 'CODE_CHAFF_SETUP_ROOT', __FILE__ );
 define( 'CODE_CHAFF_SETUP_URL', plugin_dir_url( __FILE__ ) );
-define( 'CODE_CHAFF_SETUP_CACHE_TIME_DAY', DAY_IN_SECONDS );
 define( 'CODE_CHAFF_SETUP_VERSION', '0.1.0' );
 
 /**
  * Main plugin class (all static per coding standards).
  */
 class CodeChaff {
-
-	// --- CONSTANTS ---
-	const SETUP_DIR      = \CODE_CHAFF_SETUP_DIR;
-	const SETUP_ROOT     = \CODE_CHAFF_SETUP_ROOT;
-	const SETUP_URL      = \CODE_CHAFF_SETUP_URL;
-	const CACHE_TIME_DAY = \CODE_CHAFF_SETUP_CACHE_TIME_DAY;
-	const SETUP_VERSION  = \CODE_CHAFF_SETUP_VERSION;
 
 	/**
 	 * Plugin activation handler.
@@ -307,7 +299,7 @@ class CodeChaff {
 	 * @param string $item_type 'plugin' or 'theme'.
 	 * @param string $old_ver   Old version.
 	 * @param string $new_ver   New version.
-	 * @return array Array of diffs, each with keys: file, diff, is_new, is_deleted.
+	 * @return array|\WP_Error Array of diffs, or WP_Error on failure.
 	 */
 	public static function fetch_changed_files( $slug, $item_type, $old_ver, $new_ver ) {
 		$base      = ( 'plugin' === $item_type ) ? 'plugins' : 'themes';
@@ -323,7 +315,11 @@ class CodeChaff {
 		);
 
 		$response = \wp_remote_get( $diff_url, array( 'timeout' => 30 ) );
-		if ( ! \is_wp_error( $response ) ) {
+		if ( \is_wp_error( $response ) ) {
+			error_log(
+				'[CodeChaff] Trac changeset request failed: ' . $response->get_error_message()
+			);
+		} else {
 			$body = \wp_remote_retrieve_body( $response );
 			$code = \wp_remote_retrieve_response_code( $response );
 
@@ -333,10 +329,34 @@ class CodeChaff {
 					return $parsed;
 				}
 			}
+
+			if ( 404 === $code ) {
+				error_log(
+					"[CodeChaff] Trac changeset returned 404 for {$slug}: " .
+					"version tags {$old_ver} or {$new_ver} likely do not exist."
+				);
+			}
 		}
 
 		// Fallback: fetch file trees from both SVN tags and compare.
-		return self::fetch_changed_files_fallback( $slug, $item_type, $old_ver, $new_ver );
+		$fallback = self::fetch_changed_files_fallback( $slug, $item_type, $old_ver, $new_ver );
+		if ( empty( $fallback ) ) {
+			// Distinguish between "no files changed" and "could not contact SVN at all."
+			$check_old = self::fetch_svn_file( $slug, $item_type, $old_ver, 'readme.txt' );
+			$check_new = self::fetch_svn_file( $slug, $item_type, $new_ver, 'readme.txt' );
+			if ( empty( $check_old ) && empty( $check_new ) ) {
+				return new \WP_Error(
+					'code_chaff_svn_unreachable',
+					sprintf(
+						/* translators: %s: plugin/theme slug */
+						__( 'Could not contact WordPress.org SVN for %s. Verify the slug and network connectivity.', 'code-chaff' ),
+						$slug
+					)
+				);
+			}
+		}
+
+		return $fallback;
 	}
 
 	/**
@@ -672,6 +692,9 @@ class CodeChaff {
 	 * @return void
 	 */
 	public static function run_audit( $args ) {
+		// Allow long-running audits.
+		set_time_limit( 300 );
+
 		$slug      = $args['slug'] ?? '';
 		$item_type = $args['item_type'] ?? 'plugin';
 		$old_ver   = $args['old_ver'] ?? '';
@@ -687,8 +710,33 @@ class CodeChaff {
 			return;
 		}
 
-		// fetch_changed_files now returns [{file, diff, is_new, is_deleted}, ...].
+		// fetch_changed_files may return array of diffs or WP_Error on network failure.
 		$changed_files = self::fetch_changed_files( $slug, $item_type, $old_ver, $new_ver );
+
+		if ( \is_wp_error( $changed_files ) ) {
+			error_log( '[CodeChaff] ' . $changed_files->get_error_message() );
+			global $wpdb;
+			$table = $wpdb->prefix . 'code_chaff_audits';
+			$wpdb->insert(
+				$table,
+				array(
+					'slug'         => $slug,
+					'item_type'    => $item_type,
+					'old_version'  => $old_ver,
+					'new_version'  => $new_ver,
+					'risk_level'   => 'secure',
+					'report'       => wp_json_encode(
+						array(
+							'error'  => $changed_files->get_error_code(),
+							'note'   => $changed_files->get_error_message(),
+						)
+					),
+					'completed_at' => current_time( 'mysql' ),
+				),
+				array( '%s', '%s', '%s', '%s', '%s', '%s', '%s' )
+			);
+			return;
+		}
 
 		if ( empty( $changed_files ) ) {
 			error_log( '[CodeChaff] No changed files found for ' . $slug . ' between ' . $old_ver . ' and ' . $new_ver );
@@ -1031,6 +1079,33 @@ add_action(
 			false,
 			dirname( plugin_basename( \CODE_CHAFF_SETUP_ROOT ) ) . '/languages'
 		);
+	}
+);
+
+// Display admin notice on first activation.
+add_action(
+	'admin_notices',
+	function () {
+		if ( ! get_transient( 'code_chaff_activated' ) ) {
+			return;
+		}
+		delete_transient( 'code_chaff_activated' );
+		?>
+		<div class="notice notice-success is-dismissible">
+			<p>
+				<?php
+				printf(
+					/* translators: %s: URL to CodeChaff settings */
+					esc_html__(
+						'CodeChaff is active. Configure your AI provider in the %s to start auditing plugin and theme updates.',
+						'code-chaff'
+					),
+					'<a href="' . esc_url( admin_url( 'admin.php?page=code-chaff' ) ) . '">' . esc_html__( 'Settings page', 'code-chaff' ) . '</a>'
+				);
+				?>
+			</p>
+		</div>
+		<?php
 	}
 );
 

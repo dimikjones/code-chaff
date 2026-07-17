@@ -57,6 +57,15 @@ class CodeChaff_Settings {
 			'code-chaff',
 			array( __CLASS__, 'render_settings_page' )
 		);
+
+		add_submenu_page(
+			'code-chaff',
+			__( 'Past Audits', 'code-chaff' ),
+			__( 'Past Audits', 'code-chaff' ),
+			'manage_options',
+			'code-chaff-audits',
+			array( __CLASS__, 'render_audits_page' )
+		);
 	}
 
 	/**
@@ -127,6 +136,84 @@ class CodeChaff_Settings {
 				</table>
 				<?php submit_button(); ?>
 			</form>
+		</div>
+		<?php
+	}
+
+	/**
+	 * Render the Past Audits page.
+	 *
+	 * @return void
+	 */
+	public static function render_audits_page() {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			return;
+		}
+
+		global $wpdb;
+		$table   = $wpdb->prefix . 'code_chaff_audits';
+		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared — table name is hardcoded.
+		$results = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT id, slug, item_type, old_version, new_version, risk_level, completed_at
+				 FROM %i
+				 ORDER BY completed_at DESC
+				 LIMIT 50",
+				$table
+			)
+		);
+
+		?>
+		<div class="wrap">
+			<h1><?php esc_html_e( 'Past Audits', 'code-chaff' ); ?></h1>
+			<?php if ( empty( $results ) ) : ?>
+				<p><?php esc_html_e( 'No audits have been run yet. Visit the Plugins or Themes screen and click "AI Audit" on an available update to get started.', 'code-chaff' ); ?></p>
+			<?php else : ?>
+				<table class="wp-list-table widefat fixed striped">
+					<thead>
+						<tr>
+							<th><?php esc_html_e( 'Slug', 'code-chaff' ); ?></th>
+							<th><?php esc_html_e( 'Type', 'code-chaff' ); ?></th>
+							<th><?php esc_html_e( 'Old Version', 'code-chaff' ); ?></th>
+							<th><?php esc_html_e( 'New Version', 'code-chaff' ); ?></th>
+							<th><?php esc_html_e( 'Risk', 'code-chaff' ); ?></th>
+							<th><?php esc_html_e( 'Date', 'code-chaff' ); ?></th>
+						</tr>
+					</thead>
+					<tbody>
+						<?php foreach ( $results as $row ) : ?>
+							<tr>
+								<td><?php echo esc_html( $row->slug ); ?></td>
+								<td><?php echo esc_html( ucfirst( $row->item_type ) ); ?></td>
+								<td><?php echo esc_html( $row->old_version ); ?></td>
+								<td><?php echo esc_html( $row->new_version ); ?></td>
+								<td>
+									<?php
+									$risk_labels = array(
+										'secure'   => __( 'Secure', 'code-chaff' ),
+										'warning'  => __( 'Warning', 'code-chaff' ),
+										'critical' => __( 'Critical', 'code-chaff' ),
+									);
+									$risk_classes = array(
+										'secure'   => 'notice-success',
+										'warning'  => 'notice-warning',
+										'critical' => 'notice-error',
+									);
+									$label = $risk_labels[ $row->risk_level ] ?? $row->risk_level;
+									$class = $risk_classes[ $row->risk_level ] ?? '';
+									printf(
+										'<span class="notice %s inline" style="display:inline-block;padding:2px 8px;font-weight:600;">%s</span>',
+										esc_attr( $class ),
+										esc_html( ucfirst( $label ) )
+									);
+									?>
+								</td>
+								<td><?php echo esc_html( wp_date( get_option( 'date_format' ) . ' ' . get_option( 'time_format' ), strtotime( $row->completed_at ) ) ); ?></td>
+							</tr>
+						<?php endforeach; ?>
+					</tbody>
+				</table>
+			<?php endif; ?>
 		</div>
 		<?php
 	}
