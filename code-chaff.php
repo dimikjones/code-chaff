@@ -21,8 +21,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit; // Exit if accessed directly.
 }
 
-// Load settings class.
+// Load required classes.
 require_once __DIR__ . '/includes/class-code-chaff-settings.php';
+require_once __DIR__ . '/includes/class-code-chaff-scanner.php';
 
 // --- CONSTANTS ---
 define( 'CODE_CHAFF_SETUP_DIR', __DIR__ );
@@ -291,11 +292,11 @@ class CodeChaff {
 		}
 
 		// Check 3: HTTP HEAD to the plugin's SVN directory on .org.
-		$slug        = dirname( $plugin_file );
-		$slug        = ( '.' === $slug ) ? basename( $plugin_file, '.php' ) : $slug;
-		$svn_url     = 'https://plugins.svn.wordpress.org/' . $slug . '/';
-		$response    = \wp_remote_head( $svn_url, array( 'timeout' => 10 ) );
-		$is_dot_org  = false;
+		$slug       = dirname( $plugin_file );
+		$slug       = ( '.' === $slug ) ? basename( $plugin_file, '.php' ) : $slug;
+		$svn_url    = 'https://plugins.svn.wordpress.org/' . $slug . '/';
+		$response   = \wp_remote_head( $svn_url, array( 'timeout' => 10 ) );
+		$is_dot_org = false;
 
 		if ( ! \is_wp_error( $response ) && 200 === \wp_remote_retrieve_response_code( $response ) ) {
 			$is_dot_org = true;
@@ -371,16 +372,20 @@ class CodeChaff {
 			return \as_enqueue_async_action( 'code_chaff_run_audit', $args );
 		}
 
-		// Fallback to WP-Cron.
-		return \wp_schedule_single_event( time() + 5, 'code_chaff_run_audit', array( $args ) );
+		// No Action Scheduler available — run synchronously.
+		// WP-Cron is unreliable on low-traffic sites and on hosts
+		// that disable loopback requests. Running inline guarantees
+		// the audit executes regardless of environment.
+		\do_action_ref_array( 'code_chaff_run_audit', array( $args ) );
+		return true;
 	}
 
 	/**
-	 * Fetch changed files and their diffs between two versions via Trac/SVN.
+	 * Download and extract a plugin/theme version ZIP from WordPress.org,
+	 * then compute diffs between old and new versions.
 	 *
-	 * Uses Trac's changeset diff endpoint to get a unified diff between
-	 * two version tags. Falls back to fetching individual files from SVN
-	 * and computing diffs locally if Trac diff is unavailable.
+	 * Uses downloads.wordpress.org ZIPs — far more reliable than SVN HTML scraping.
+	 * Returns an array of per-file diffs with the same structure as before.
 	 *
 	 * @param string $slug      Item slug.
 	 * @param string $item_type 'plugin' or 'theme'.
@@ -389,171 +394,69 @@ class CodeChaff {
 	 * @return array|\WP_Error Array of diffs, or WP_Error on failure.
 	 */
 	public static function fetch_changed_files( $slug, $item_type, $old_ver, $new_ver ) {
-		$base      = ( 'plugin' === $item_type ) ? 'plugins' : 'themes';
-		$trac_root = "https://{$base}.trac.wordpress.org";
-
-		// Try Trac changeset diff first (most reliable for getting actual diffs).
-		$diff_url = "{$trac_root}/changeset?" . http_build_query(
-			array(
-				'new'    => "tags/{$new_ver}",
-				'old'    => "tags/{$old_ver}",
-				'format' => 'diff',
-			)
-		);
-
-		$response = \wp_remote_get( $diff_url, array( 'timeout' => 30 ) );
-		if ( \is_wp_error( $response ) ) {
-			error_log(
-				'[CodeChaff] Trac changeset request failed: ' . $response->get_error_message()
-			);
-		} else {
-			$body = \wp_remote_retrieve_body( $response );
-			$code = \wp_remote_retrieve_response_code( $response );
-
-			if ( 200 === $code && ! empty( $body ) ) {
-				$parsed = self::parse_unified_diff( $body );
-				if ( ! empty( $parsed ) ) {
-					return $parsed;
-				}
-			}
-
-			if ( 404 === $code ) {
-				error_log(
-					"[CodeChaff] Trac changeset returned 404 for {$slug}: " .
-					"version tags {$old_ver} or {$new_ver} likely do not exist."
-				);
-			}
+		$old_dir = self::download_and_extract( $slug, $item_type, $old_ver );
+		if ( \is_wp_error( $old_dir ) && 'code_chaff_version_not_found' !== $old_dir->get_error_code() ) {
+			return $old_dir;
 		}
 
-		// Fallback: fetch file trees from both SVN tags and compare.
-		$fallback = self::fetch_changed_files_fallback( $slug, $item_type, $old_ver, $new_ver );
-		if ( empty( $fallback ) ) {
-			// Distinguish between "no files changed" and "could not contact SVN at all."
-			$check_old = self::fetch_svn_file( $slug, $item_type, $old_ver, 'readme.txt' );
-			$check_new = self::fetch_svn_file( $slug, $item_type, $new_ver, 'readme.txt' );
-			if ( empty( $check_old ) && empty( $check_new ) ) {
-				return new \WP_Error(
-					'code_chaff_svn_unreachable',
-					sprintf(
-						/* translators: %s: plugin/theme slug */
-						__( 'Could not contact WordPress.org SVN for %s. Verify the slug and network connectivity.', 'code-chaff' ),
-						$slug
-					)
-				);
-			}
+		$new_dir = self::download_and_extract( $slug, $item_type, $new_ver );
+		if ( \is_wp_error( $new_dir ) ) {
+			self::cleanup_temp_dir( $old_dir );
+			return $new_dir;
 		}
-
-		return $fallback;
-	}
-
-	/**
-	 * Fallback: compare file trees between two SVN tags and compute diffs locally.
-	 *
-	 * @param string $slug      Item slug.
-	 * @param string $item_type 'plugin' or 'theme'.
-	 * @param string $old_ver   Old version.
-	 * @param string $new_ver   New version.
-	 * @return array Array of diff entries.
-	 */
-	private static function fetch_changed_files_fallback( $slug, $item_type, $old_ver, $new_ver ) {
-		$old_files = self::list_svn_files( $slug, $item_type, $old_ver );
-		$new_files = self::list_svn_files( $slug, $item_type, $new_ver );
 
 		$results = array();
 
-		// Files present in both — compute diff.
-		foreach ( $new_files as $file ) {
-			if ( in_array( $file, $old_files, true ) ) {
-				$old_content = self::fetch_svn_file( $slug, $item_type, $old_ver, $file );
-				$new_content = self::fetch_svn_file( $slug, $item_type, $new_ver, $file );
+		// Both versions available — scan all PHP/JS files in the new version.
+		$old_files = is_string( $old_dir ) ? self::scan_code_files( $old_dir ) : array();
+		$new_files = self::scan_code_files( $new_dir );
 
-				if ( $old_content !== $new_content && ! empty( $new_content ) ) {
-					$diff      = self::compute_text_diff( $old_content, $new_content, $file );
-					$results[] = array(
-						'file'       => $file,
-						'diff'       => $diff,
-						'is_new'     => false,
-						'is_deleted' => false,
-					);
-				}
-			} elseif ( ! in_array( $file, $old_files, true ) ) {
-				// New file — include full content as the diff.
-				$content = self::fetch_svn_file( $slug, $item_type, $new_ver, $file );
-				if ( ! empty( $content ) ) {
-					$results[] = array(
-						'file'       => $file,
-						'diff'       => $content,
-						'is_new'     => true,
-						'is_deleted' => false,
-					);
-				}
+		foreach ( $new_files as $rel_path ) {
+			$new_content = file_get_contents( $new_dir . '/' . $rel_path );
+			$has_old     = is_string( $old_dir ) && in_array( $rel_path, $old_files, true );
+			$old_content = $has_old ? file_get_contents( $old_dir . '/' . $rel_path ) : '';
+
+			if ( ! $has_old ) {
+				// New file.
+				$results[] = array(
+					'file'       => $rel_path,
+					'diff'       => (string) $new_content,
+					'is_new'     => true,
+					'is_deleted' => false,
+				);
+			} elseif ( $old_content !== $new_content ) {
+				// Changed file — compute unified diff.
+				$diff      = self::compute_text_diff( $old_content, $new_content, $rel_path );
+				$results[] = array(
+					'file'       => $rel_path,
+					'diff'       => $diff,
+					'is_new'     => false,
+					'is_deleted' => false,
+				);
 			}
 		}
 
 		// Deleted files (present in old, not in new).
-		foreach ( $old_files as $file ) {
-			if ( ! in_array( $file, $new_files, true ) ) {
-				$results[] = array(
-					'file'       => $file,
-					'diff'       => '[File deleted in new version]',
-					'is_new'     => false,
-					'is_deleted' => true,
-				);
-			}
-		}
-
-		return $results;
-	}
-
-	/**
-	 * Parse a unified diff into per-file diff entries.
-	 *
-	 * Splits a multi-file unified diff string into individual file diffs,
-	 * filtering to only .php and .js files.
-	 *
-	 * @param string $diff_body Full unified diff content.
-	 * @return array Array of ['file' => path, 'diff' => file_diff, 'is_new' => bool, 'is_deleted' => bool].
-	 */
-	private static function parse_unified_diff( $diff_body ) {
-		$results  = array();
-		$lines    = explode( "\n", $diff_body );
-		$buffer   = array();
-		$cur_file = '';
-
-		foreach ( $lines as $line ) {
-			// Detect file header lines: "Index: path/to/file.php" or "--- path/to/file.php" in unified diff.
-			if ( preg_match( '/^(?:Index:\s+|[-]{3}\s+)(.+?)(?:\t|$)/', $line, $m ) ) {
-				$candidate = trim( $m[1] );
-				// Skip /dev/null references and strip leading a/ or b/ prefixes.
-				if ( '/dev/null' !== $candidate && 'a/' !== $candidate && 'b/' !== $candidate ) {
-					$candidate = preg_replace( '!^[ab]/!', '', $candidate );
-					if ( '.' !== $candidate && preg_match( '/\.(php|js)$/', $candidate ) ) {
-						if ( $cur_file && ! empty( $buffer ) ) {
-							$results[] = array(
-								'file'       => $cur_file,
-								'diff'       => implode( "\n", $buffer ),
-								'is_new'     => self::is_new_file_diff( $buffer ),
-								'is_deleted' => self::is_deleted_file_diff( $buffer ),
-							);
-						}
-						$cur_file = $candidate;
-						$buffer   = array();
-					}
+		if ( is_string( $old_dir ) ) {
+			foreach ( $old_files as $rel_path ) {
+				if ( ! in_array( $rel_path, $new_files, true ) ) {
+					$results[] = array(
+						'file'       => $rel_path,
+						'diff'       => '[File deleted in new version]',
+						'is_new'     => false,
+						'is_deleted' => true,
+					);
 				}
 			}
-
-			if ( $cur_file ) {
-				$buffer[] = $line;
-			}
 		}
 
-		// Don't forget the last file.
-		if ( $cur_file && ! empty( $buffer ) ) {
-			$results[] = array(
-				'file'       => $cur_file,
-				'diff'       => implode( "\n", $buffer ),
-				'is_new'     => self::is_new_file_diff( $buffer ),
-				'is_deleted' => self::is_deleted_file_diff( $buffer ),
+		self::cleanup_temp_dir( $old_dir );
+		self::cleanup_temp_dir( $new_dir );
+
+		if ( empty( $results ) ) {
+			return new \WP_Error(
+				'code_chaff_no_changes',
+				__( 'No code changes found between the versions.', 'code-chaff' )
 			);
 		}
 
@@ -561,113 +464,249 @@ class CodeChaff {
 	}
 
 	/**
-	 * Check if a diff buffer represents a newly created file.
-	 *
-	 * @param array $buffer Diff lines.
-	 * @return bool
-	 */
-	private static function is_new_file_diff( $buffer ) {
-		// New files have "--- /dev/null" or "new file mode" in the header.
-		$joined = implode( "\n", array_slice( $buffer, 0, 5 ) );
-		return ( false !== strpos( $joined, 'new file mode' ) || false !== strpos( $joined, '--- /dev/null' ) );
-	}
-
-	/**
-	 * Check if a diff buffer represents a deleted file.
-	 *
-	 * @param array $buffer Diff lines.
-	 * @return bool
-	 */
-	private static function is_deleted_file_diff( $buffer ) {
-		$joined = implode( "\n", array_slice( $buffer, 0, 5 ) );
-		return ( false !== strpos( $joined, 'deleted file mode' ) || false !== strpos( $joined, '+++ /dev/null' ) );
-	}
-
-	/**
-	 * List all .php and .js files in an SVN tag directory.
-	 *
-	 * Fetches and parses the SVN HTML directory listing for a version tag.
+	 * Download a plugin/theme ZIP from WordPress.org and extract it.
 	 *
 	 * @param string $slug      Item slug.
 	 * @param string $item_type 'plugin' or 'theme'.
-	 * @param string $version   Version tag.
-	 * @return array List of relative file paths.
+	 * @param string $version   Version number.
+	 * @return string|\WP_Error Path to extracted directory, or WP_Error.
 	 */
-	private static function list_svn_files( $slug, $item_type, $version ) {
-		$base = ( 'theme' === $item_type )
-			? 'https://themes.svn.wordpress.org/'
-			: 'https://plugins.svn.wordpress.org/';
+	private static function download_and_extract( $slug, $item_type, $version ) {
+		$base = ( 'theme' === $item_type ) ? 'theme' : 'plugin';
+		$url  = "https://downloads.wordpress.org/{$base}/{$slug}.{$version}.zip";
 
-		$cache_key = 'code_chaff_svn_list_' . md5( $base . $slug . '/tags/' . $version );
-		$cached    = wp_cache_get( $cache_key, 'code_chaff' );
+		$tmp_zip = self::get_temp_dir() . '/' . $slug . '-' . $version . '.zip';
+		$tmp_ext = self::get_temp_dir() . '/' . $slug . '-' . $version;
 
-		if ( is_array( $cached ) ) {
-			return $cached;
+		// Check if already extracted (within this request).
+		if ( is_dir( $tmp_ext ) ) {
+			// Guard against empty dirs left from a previous crashed run.
+			$contents = @scandir( $tmp_ext );
+			if ( is_array( $contents ) && count( $contents ) > 2 ) {
+				return $tmp_ext;
+			}
+			// Directory exists but is empty — clean up and re-download.
+			self::cleanup_temp_dir( $tmp_ext );
 		}
 
-		$files = self::walk_svn_directory( $base, $slug, $version, '' );
+		// Download the ZIP.
+		$response = \wp_remote_get(
+			$url,
+			array(
+				'timeout'  => 60,
+				'stream'   => true,
+				'filename' => $tmp_zip,
+			)
+		);
 
-		wp_cache_set( $cache_key, $files, 'code_chaff', HOUR_IN_SECONDS );
+		if ( \is_wp_error( $response ) ) {
+			return new \WP_Error(
+				'code_chaff_download_failed',
+				sprintf(
+					/* translators: 1: slug, 2: error */
+					__( 'Failed to download %1$s version %2$s: %3$s', 'code-chaff' ),
+					$slug,
+					$version,
+					$response->get_error_message()
+				)
+			);
+		}
 
+		$code = \wp_remote_retrieve_response_code( $response );
+		if ( 404 === $code ) {
+			return new \WP_Error(
+				'code_chaff_version_not_found',
+				sprintf(
+					/* translators: 1: slug, 2: version */
+					__( 'Version %2$s of %1$s does not exist on WordPress.org.', 'code-chaff' ),
+					$slug,
+					$version
+				)
+			);
+		}
+
+		if ( 200 !== $code ) {
+			@unlink( $tmp_zip );
+			return new \WP_Error(
+				'code_chaff_download_failed',
+				sprintf(
+					/* translators: 1: slug, 2: HTTP code */
+					__( 'Download failed for %1$s (HTTP %2$d).', 'code-chaff' ),
+					$slug,
+					$code
+				)
+			);
+		}
+
+		// Some hosting environments don't support stream + filename; retry without.
+		if ( ! file_exists( $tmp_zip ) || 0 === filesize( $tmp_zip ) ) {
+			$body    = \wp_remote_retrieve_body( $response );
+			$written = file_put_contents( $tmp_zip, $body );
+			if ( false === $written || 0 === $written ) {
+				return new \WP_Error(
+					'code_chaff_download_failed',
+					__( 'Could not save the downloaded ZIP file.', 'code-chaff' )
+				);
+			}
+		}
+
+		// Extract the ZIP.
+		$extracted = self::extract_zip( $tmp_zip, $tmp_ext );
+		@unlink( $tmp_zip );
+
+		if ( \is_wp_error( $extracted ) ) {
+			return $extracted;
+		}
+
+		return $tmp_ext;
+	}
+
+	/**
+	 * Extract a ZIP file to a destination directory.
+	 *
+	 * @param string $zip_path Path to the ZIP file.
+	 * @param string $dest_dir Destination directory.
+	 * @return true|\WP_Error
+	 */
+	private static function extract_zip( $zip_path, $dest_dir ) {
+		if ( ! class_exists( 'ZipArchive' ) ) {
+			// Fallback for hosts without ZipArchive.
+			require_once ABSPATH . 'wp-admin/includes/file.php';
+			$result = unzip_file( $zip_path, $dest_dir );
+			if ( \is_wp_error( $result ) ) {
+				return $result;
+			}
+			return true;
+		}
+
+		$zip = new \ZipArchive();
+		if ( true !== $zip->open( $zip_path ) ) {
+			return new \WP_Error(
+				'code_chaff_unzip_failed',
+				__( 'Could not open the downloaded ZIP archive.', 'code-chaff' )
+			);
+		}
+
+		// WordPress ZIPs have a single root folder (e.g. akismet/).
+		// Extract, then move contents up one level if nested.
+		$zip->extractTo( $dest_dir );
+		$zip->close();
+
+		// Handle nested WordPress plugin folder.
+		$entries = scandir( $dest_dir );
+		$entries = array_diff( (array) $entries, array( '.', '..' ) );
+
+		if ( 1 === count( $entries ) ) {
+			$inner = $dest_dir . '/' . reset( $entries );
+			if ( is_dir( $inner ) ) {
+				// Move contents of inner directory up to dest_dir.
+				$inner_files = scandir( $inner );
+				foreach ( $inner_files as $f ) {
+					if ( '.' === $f || '..' === $f ) {
+						continue;
+					}
+					rename( $inner . '/' . $f, $dest_dir . '/' . $f );
+				}
+				rmdir( $inner );
+			}
+		}
+
+		return true;
+	}
+
+	/**
+	 * Recursively scan a directory for .php and .js files.
+	 *
+	 * @param string $dir Directory path.
+	 * @return array List of relative file paths.
+	 */
+	private static function scan_code_files( $dir ) {
+		if ( ! is_dir( $dir ) ) {
+			return array();
+		}
+
+		$files   = array();
+		$dir_len = strlen( rtrim( $dir, '/\\' ) ) + 1;
+		$iter    = new \RecursiveIteratorIterator(
+			new \RecursiveDirectoryIterator(
+				$dir,
+				\FilesystemIterator::KEY_AS_PATHNAME | \FilesystemIterator::CURRENT_AS_FILEINFO | \FilesystemIterator::SKIP_DOTS
+			)
+		);
+
+		try {
+			foreach ( $iter as $item ) {
+				if ( ! $item->isFile() ) {
+					continue;
+				}
+				$ext = strtolower( $item->getExtension() );
+				if ( 'php' !== $ext && 'js' !== $ext ) {
+					continue;
+				}
+				$rel     = substr( $item->getPathname(), $dir_len );
+				$files[] = str_replace( '\\', '/', $rel );
+			}
+		} catch ( \UnexpectedValueException $e ) {
+			// Directory with bad permissions (e.g. fonts/ from a ZIP).
+			// Skip it; the iterator will continue from the next valid entry.
+			error_log( '[CodeChaff] Skipping unreadable path during scan: ' . $e->getMessage() );
+		}
+
+		sort( $files );
 		return $files;
 	}
 
 	/**
-	 * Recursively walk an SVN directory to find .php and .js files.
+	 * Get or create the CodeChaff temp directory.
 	 *
-	 * @param string $base      Base SVN URL.
-	 * @param string $slug      Item slug.
-	 * @param string $version   Version tag.
-	 * @param string $sub_path  Current subdirectory path.
-	 * @param int    $depth     Current recursion depth (max 5).
-	 * @return array List of file paths relative to the tag root.
+	 * @return string Path to temp directory.
 	 */
-	private static function walk_svn_directory( $base, $slug, $version, $sub_path, $depth = 0 ) {
-		if ( $depth > 5 ) {
-			return array();
+	private static function get_temp_dir() {
+		$upload_dir = wp_upload_dir();
+		$tmp_dir    = $upload_dir['basedir'] . '/code-chaff-temp';
+
+		if ( ! is_dir( $tmp_dir ) ) {
+			wp_mkdir_p( $tmp_dir );
 		}
 
-		$url      = $base . $slug . '/tags/' . $version . '/' . $sub_path;
-		$response = \wp_remote_get( $url, array( 'timeout' => 15 ) );
+		return $tmp_dir;
+	}
 
-		if ( \is_wp_error( $response ) || 200 !== \wp_remote_retrieve_response_code( $response ) ) {
-			return array();
+	/**
+	 * Clean up a temp extraction directory.
+	 *
+	 * @param string|\WP_Error $dir Directory path or WP_Error.
+	 * @return void
+	 */
+	private static function cleanup_temp_dir( $dir ) {
+		if ( ! is_string( $dir ) || ! is_dir( $dir ) || 0 !== strpos( $dir, self::get_temp_dir() ) ) {
+			return;
 		}
 
-		$body  = \wp_remote_retrieve_body( $response );
-		$files = array();
+		// Safety: only delete dirs inside our temp dir.
+		// Suppress warnings — "Text file busy" can happen on Linux when
+		// directory iterators from scan_code_files() still hold handles.
+		try {
+			$iter = new \RecursiveIteratorIterator(
+				new \RecursiveDirectoryIterator( $dir, \RecursiveDirectoryIterator::SKIP_DOTS ),
+				\RecursiveIteratorIterator::CHILD_FIRST
+			);
 
-		// Parse SVN HTML directory listing for file and directory links.
-		// SVN listing uses <li><a href="...">filename</a></li> format.
-		if ( preg_match_all( '!<li><a href="([^"]+)">([^<]+)</a></li>!', $body, $matches, PREG_SET_ORDER ) ) {
-			foreach ( $matches as $match ) {
-				$name = trim( $match[2] );
-				$href = trim( $match[1] );
-
-				// Skip parent directory link and non-code files.
-				if ( '' === $name || '/' === $name || '../' === $name ) {
-					continue;
-				}
-
-				// Directory: href ends with /
-				if ( '/' === substr( $href, -1 ) ) {
-					$sub_files = self::walk_svn_directory(
-						$base,
-						$slug,
-						$version,
-						( $sub_path ? $sub_path . '/' : '' ) . $name,
-						$depth + 1
-					);
-					foreach ( $sub_files as $sf ) {
-						$files[] = $sf;
-					}
-				} elseif ( preg_match( '/\.(php|js)$/', $name ) ) {
-					$files[] = $sub_path ? $sub_path . '/' . $name : $name;
+			foreach ( $iter as $item ) {
+				if ( $item->isDir() ) {
+					@rmdir( $item->getPathname() );
+				} else {
+					@unlink( $item->getPathname() );
 				}
 			}
-		}
 
-		return $files;
+			$iter = null; // Release iterator handles.
+			clearstatcache( true, $dir );
+			@rmdir( $dir );
+		} catch ( \UnexpectedValueException $e ) {
+			// Best-effort cleanup; temp dirs will be cleaned on next run.
+			error_log( '[CodeChaff] Could not fully clean temp dir: ' . $e->getMessage() );
+		}
 	}
 
 	/**
@@ -749,31 +788,12 @@ class CodeChaff {
 	}
 
 	/**
-	 * Fetch raw file content from SVN tag.
-	 *
-	 * @param string $slug      Item slug.
-	 * @param string $item_type 'plugin' or 'theme'.
-	 * @param string $version   Version tag.
-	 * @param string $file      Relative file path.
-	 * @return string Raw file contents or empty string on failure.
-	 */
-	public static function fetch_svn_file( $slug, $item_type, $version, $file ) {
-		$base = ( 'theme' === $item_type )
-			? 'https://themes.svn.wordpress.org/'
-			: 'https://plugins.svn.wordpress.org/';
-
-		$url      = $base . $slug . '/tags/' . $version . '/' . ltrim( $file, '/' );
-		$response = \wp_remote_get( $url, array( 'timeout' => 20 ) );
-
-		if ( \is_wp_error( $response ) ) {
-			return '';
-		}
-
-		return \wp_remote_retrieve_body( $response );
-	}
-
-	/**
 	 * Execute the actual AI audit (called by async action).
+	 *
+	 * Phase 1: Downloads and extracts both plugin/theme versions.
+	 * Phase 2: Runs a lightweight security scanner on changed files.
+	 * Phase 3: Sends scanner findings with code windows to the AI for classification.
+	 * Phase 4: Stores the triaged report.
 	 *
 	 * @param array $args Job arguments.
 	 * @return void
@@ -797,7 +817,7 @@ class CodeChaff {
 			return;
 		}
 
-		// fetch_changed_files may return array of diffs or WP_Error on network failure.
+		// Phase 1: Download and diff.
 		$changed_files = self::fetch_changed_files( $slug, $item_type, $old_ver, $new_ver );
 
 		if ( \is_wp_error( $changed_files ) ) {
@@ -814,8 +834,8 @@ class CodeChaff {
 					'risk_level'   => 'secure',
 					'report'       => wp_json_encode(
 						array(
-							'error'  => $changed_files->get_error_code(),
-							'note'   => $changed_files->get_error_message(),
+							'error' => $changed_files->get_error_code(),
+							'note'  => $changed_files->get_error_message(),
 						)
 					),
 					'completed_at' => current_time( 'mysql' ),
@@ -824,147 +844,136 @@ class CodeChaff {
 			);
 			return;
 		}
-
-		if ( empty( $changed_files ) ) {
-			error_log( '[CodeChaff] No changed files found for ' . $slug . ' between ' . $old_ver . ' and ' . $new_ver );
-			// Still record an empty audit so the user knows it ran.
-			global $wpdb;
-			$table = $wpdb->prefix . 'code_chaff_audits';
-			$wpdb->insert(
-				$table,
-				array(
-					'slug'         => $slug,
-					'item_type'    => $item_type,
-					'old_version'  => $old_ver,
-					'new_version'  => $new_ver,
-					'risk_level'   => 'secure',
-					'report'       => wp_json_encode(
-						array(
-							'note' => 'No changed .php or .js files found between these versions.',
-						)
-					),
-					'completed_at' => current_time( 'mysql' ),
-				),
-				array( '%s', '%s', '%s', '%s', '%s', '%s', '%s' )
-			);
-			return;
-		}
-
-		$report = array(
-			'security'    => array(),
-			'performance' => array(),
-			'files'       => array(),
-		);
 
 		// Limit files per job to prevent timeouts (max 25 changed files).
 		$max_files     = 25;
 		$changed_files = array_slice( $changed_files, 0, $max_files );
 
-		// Prevent object cache from bloating during batch processing.
 		\wp_suspend_cache_addition( true );
+
+		// Phase 2: Run the lightweight scanner on each changed file.
+		$all_findings = array();
+		$report_files = array();
 
 		foreach ( $changed_files as $change ) {
 			$file       = $change['file'];
-			$diff       = $change['diff'];
 			$is_new     = $change['is_new'] ?? false;
 			$is_deleted = $change['is_deleted'] ?? false;
 
-			// Record metadata about this file change.
-			$report['files'][ $file ] = array(
+			$report_files[ $file ] = array(
 				'is_new'     => $is_new,
 				'is_deleted' => $is_deleted,
 			);
 
-			// Skip deleted files — nothing to audit.
 			if ( $is_deleted ) {
 				continue;
 			}
 
-			if ( ! $diff ) {
+			// Only scan .php files (JS auditing would need a different scanner).
+			if ( '.php' !== strtolower( substr( $file, -4 ) ) ) {
 				continue;
 			}
 
-			// Security prompt — audit the code diff for security issues.
-			$sec_schema = array(
-				'type'       => 'object',
-				'properties' => array(
-					'issues' => array(
-						'type'  => 'array',
-						'items' => array(
-							'type'       => 'object',
-							'properties' => array(
-								'severity' => array(
-									'type' => 'string',
-									'enum' => array( 'critical', 'high', 'medium', 'low', 'info' ),
+			$diff     = $change['diff'];
+			$findings = CodeChaff_Scanner::scan( $diff, $file );
+
+			if ( ! empty( $findings ) ) {
+				$all_findings = array_merge( $all_findings, $findings );
+			}
+		}
+
+		$report = array(
+			'files'   => $report_files,
+			'scanner' => array(
+				'total_findings' => count( $all_findings ),
+			),
+			'triage'  => array(),
+		);
+
+		// Phase 3: AI triage of scanner findings (if any).
+		if ( ! empty( $all_findings ) ) {
+			// Always include the raw scanner findings for reference.
+			$report['scanner']['findings'] = array_slice( $all_findings, 0, 15 );
+
+			try {
+				$blocks   = array();
+				$max_find = min( 15, count( $all_findings ) );
+
+				for ( $i = 0; $i < $max_find; $i++ ) {
+					$f        = $all_findings[ $i ];
+					$blocks[] = sprintf(
+						"### Finding %d\nFile: %s\nLine: %d\nRule: %s\nMessage: %s\n\nCode:\n%s\n",
+						$i + 1,
+						$f['file'],
+						$f['line'],
+						$f['rule'],
+						$f['message'],
+						$f['code']
+					);
+				}
+
+				$findings_text = implode( "\n", $blocks );
+				$triage_schema = array(
+					'type'       => 'object',
+					'properties' => array(
+						'verdicts' => array(
+							'type'  => 'array',
+							'items' => array(
+								'type'       => 'object',
+								'properties' => array(
+									'finding_id' => array( 'type' => 'integer' ),
+									'verdict'    => array(
+										'type' => 'string',
+										'enum' => array( 'LIKELY REAL', 'LIKELY FALSE POSITIVE', 'CANNOT TELL' ),
+									),
+									'reasoning'  => array( 'type' => 'string' ),
 								),
-								'category' => array( 'type' => 'string' ),
-								'message'  => array( 'type' => 'string' ),
+								'required'   => array( 'finding_id', 'verdict', 'reasoning' ),
 							),
-							'required'   => array( 'severity', 'category', 'message' ),
 						),
+						'summary'  => array( 'type' => 'string' ),
 					),
-				),
-				'required'   => array( 'issues' ),
-			);
+					'required'   => array( 'verdicts', 'summary' ),
+				);
 
-			$sec_builder = \wp_ai_client_prompt()
-				->with_text( $diff )
-				->using_system_instruction(
-					'You are a security auditor reviewing a code diff between plugin/theme versions. ' .
-					'Audit the changes for OWASP Top 10 issues, missing sanitization or escaping, ' .
-					'lack of nonce verification, privilege escalation, and authentication bypass risks. ' .
-					'Lines starting with "-" are removed code, "+" are added code. ' .
-					'Output must be valid JSON only, no other text.'
-				)
-				->as_json_response( $sec_schema );
+				$triage_builder = \wp_ai_client_prompt()
+					->with_text( $findings_text )
+					->using_system_instruction(
+						'You are a senior PHP/WordPress security reviewer triaging automated code-scanner ' .
+						'findings from a plugin update diff. The scanner produces many false positives — ' .
+						'your job is classification. For EACH finding numbered #1–#N: examine the code ' .
+						'window (>> marks the flagged line). State LIKELY REAL if exploitable or bad practice, ' .
+						'LIKELY FALSE POSITIVE if the code is safe (escaping happens elsewhere, input validated ' .
+						'before this line, nonce checked in a parent function, etc.), or CANNOT TELL if the ' .
+						'window is too small to determine. Prefer CANNOT TELL over guessing. Do NOT describe ' .
+						'findings not present in the input. Provide one overall summary recommendation after ' .
+						'all verdicts. Output valid JSON only.'
+					)
+					->as_json_response( $triage_schema );
 
-			$sec_result = $sec_builder->generate_text();
+				$triage_result = $triage_builder->generate_text();
 
-			// Performance prompt — audit the code diff for performance issues.
-			$perf_schema = array(
-				'type'       => 'object',
-				'properties' => array(
-					'issues' => array(
-						'type'  => 'array',
-						'items' => array(
-							'type'       => 'object',
-							'properties' => array(
-								'severity' => array(
-									'type' => 'string',
-									'enum' => array( 'critical', 'high', 'medium', 'low', 'info' ),
-								),
-								'category' => array( 'type' => 'string' ),
-								'message'  => array( 'type' => 'string' ),
-							),
-							'required'   => array( 'severity', 'category', 'message' ),
-						),
-					),
-				),
-				'required'   => array( 'issues' ),
-			);
-
-			$perf_builder = \wp_ai_client_prompt()
-				->with_text( $diff )
-				->using_system_instruction(
-					'You are a performance auditor reviewing a code diff between plugin/theme versions. ' .
-					'Analyze the changes for unoptimized SQL queries, N+1 problems, missing caching, ' .
-					'inefficient loops, uncached remote requests, and excessive filesystem operations. ' .
-					'Lines starting with "-" are removed code, "+" are added code. ' .
-					'Output must be valid JSON only, no other text.'
-				)
-				->as_json_response( $perf_schema );
-
-			$perf_result = $perf_builder->generate_text();
-
-			// Store results (decode JSON if valid, otherwise store as raw error).
-			$report['security'][ $file ]    = ! \is_wp_error( $sec_result ) ? $sec_result : $sec_result->get_error_message();
-			$report['performance'][ $file ] = ! \is_wp_error( $perf_result ) ? $perf_result : $perf_result->get_error_message();
+				if ( ! \is_wp_error( $triage_result ) ) {
+					$decoded          = json_decode( $triage_result, true );
+					$report['triage'] = $decoded ? $decoded : array( 'raw' => $triage_result );
+				} else {
+					$report['triage'] = array( 'error' => $triage_result->get_error_message() );
+				}
+			} catch ( \Throwable $e ) {
+				// Guard against provider bugs (e.g. incorrect constructor arguments).
+				// The scanner findings are stored in the report regardless.
+				error_log( '[CodeChaff] AI triage failed: ' . $e->getMessage() );
+				$report['triage'] = array(
+					'error'   => 'ai_triage_exception',
+					'message' => $e->getMessage(),
+				);
+			}
 		}
 
 		\wp_suspend_cache_addition( false );
 
-		// Compute risk level from structured audit data.
-		$risk = self::compute_risk_level( $report );
+		// Compute risk level from triage verdicts.
+		$risk = self::compute_triage_risk_level( $report );
 
 		global $wpdb;
 		$table = $wpdb->prefix . 'code_chaff_audits';
@@ -982,6 +991,40 @@ class CodeChaff {
 			),
 			array( '%s', '%s', '%s', '%s', '%s', '%s', '%s' )
 		);
+	}
+
+	/**
+	 * Compute risk level from AI triage verdicts.
+	 *
+	 * @param array $report The full audit report.
+	 * @return string 'secure', 'warning', or 'critical'.
+	 */
+	private static function compute_triage_risk_level( $report ) {
+		$real_count = 0;
+		$total      = 0;
+
+		if ( ! empty( $report['triage']['verdicts'] ) && is_array( $report['triage']['verdicts'] ) ) {
+			foreach ( $report['triage']['verdicts'] as $v ) {
+				++$total;
+				if ( isset( $v['verdict'] ) && 'LIKELY REAL' === strtoupper( $v['verdict'] ) ) {
+					++$real_count;
+				}
+			}
+		}
+
+		if ( $real_count >= 3 ) {
+			return 'critical';
+		}
+		if ( $real_count >= 1 ) {
+			return 'warning';
+		}
+
+		// If no triage but scanner found things, mark as warning.
+		if ( ! empty( $report['scanner']['total_findings'] ) && $report['scanner']['total_findings'] > 0 ) {
+			return 'warning';
+		}
+
+		return 'secure';
 	}
 
 	/**
