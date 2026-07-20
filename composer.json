@@ -1,0 +1,8 @@
+{
+    "name": "dimikjones/code-chaff",
+    "description": "Separate the wheat from the chaff — AI-powered security audit for WordPress plugin and theme updates.",
+    "type": "wordpress-plugin",
+    "require": {
+        "woocommerce/action-scheduler": "^3.7"
+    }
+}

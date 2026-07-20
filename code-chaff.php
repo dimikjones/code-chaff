@@ -21,6 +21,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit; // Exit if accessed directly.
 }
 
+// Load Action Scheduler (safe-loading: only loads if not already present).
+require_once __DIR__ . '/vendor/woocommerce/action-scheduler/action-scheduler.php';
+
 // Load required classes.
 require_once __DIR__ . '/includes/class-code-chaff-settings.php';
 require_once __DIR__ . '/includes/class-code-chaff-scanner.php';
@@ -64,18 +67,9 @@ class CodeChaff {
 		// Clear activation transient.
 		delete_transient( 'code_chaff_activated' );
 
-		// Unschedule any pending WP-Cron audit hooks.
-		$cron = _get_cron_array();
-		if ( is_array( $cron ) ) {
-			foreach ( $cron as $timestamp => $hooks ) {
-				if ( isset( $hooks['code_chaff_run_audit'] ) ) {
-					unset( $cron[ $timestamp ]['code_chaff_run_audit'] );
-					if ( empty( $cron[ $timestamp ] ) ) {
-						unset( $cron[ $timestamp ] );
-					}
-				}
-			}
-			_set_cron_array( $cron );
+		// Cancel any pending Action Scheduler audit jobs.
+		if ( \function_exists( 'as_unschedule_all_actions' ) ) {
+			\as_unschedule_all_actions( 'code_chaff_run_audit' );
 		}
 	}
 
@@ -207,15 +201,6 @@ class CodeChaff {
 			'action_id' => $action_id,
 			'message'   => __( 'Audit job queued for background processing.', 'code-chaff' ),
 		);
-	}
-
-	/**
-	 * Check if Action Scheduler is available.
-	 *
-	 * @return bool True if Action Scheduler is active.
-	 */
-	public static function has_action_scheduler() {
-		return \function_exists( 'as_enqueue_async_action' );
 	}
 
 	/**
@@ -368,16 +353,9 @@ class CodeChaff {
 			'new_ver'   => $new_ver,
 		);
 
-		if ( self::has_action_scheduler() ) {
-			return \as_enqueue_async_action( 'code_chaff_run_audit', $args );
-		}
-
-		// No Action Scheduler available — run synchronously.
-		// WP-Cron is unreliable on low-traffic sites and on hosts
-		// that disable loopback requests. Running inline guarantees
-		// the audit executes regardless of environment.
-		\do_action_ref_array( 'code_chaff_run_audit', array( $args ) );
-		return true;
+		// Action Scheduler flattens associative args into positional arguments.
+		// Wrap in a single-element array to preserve the structure.
+		return \as_enqueue_async_action( 'code_chaff_run_audit', array( $args ) );
 	}
 
 	/**
@@ -412,9 +390,17 @@ class CodeChaff {
 		$new_files = self::scan_code_files( $new_dir );
 
 		foreach ( $new_files as $rel_path ) {
-			$new_content = file_get_contents( $new_dir . '/' . $rel_path );
-			$has_old     = is_string( $old_dir ) && in_array( $rel_path, $old_files, true );
-			$old_content = $has_old ? file_get_contents( $old_dir . '/' . $rel_path ) : '';
+			$new_file_path = $new_dir . '/' . $rel_path;
+			$new_content   = @file_get_contents( $new_file_path );
+			if ( false === $new_content ) {
+				continue;
+			}
+			$has_old       = is_string( $old_dir ) && in_array( $rel_path, $old_files, true );
+			$old_file_path = $has_old ? $old_dir . '/' . $rel_path : null;
+			$old_content   = $old_file_path ? (string) @file_get_contents( $old_file_path ) : '';
+			if ( false === $old_content ) {
+				$old_content = '';
+			}
 
 			if ( ! $has_old ) {
 				// New file.
@@ -480,12 +466,11 @@ class CodeChaff {
 
 		// Check if already extracted (within this request).
 		if ( is_dir( $tmp_ext ) ) {
-			// Guard against empty dirs left from a previous crashed run.
-			$contents = @scandir( $tmp_ext );
-			if ( is_array( $contents ) && count( $contents ) > 2 ) {
+			// Only reuse if a previous extraction completed successfully.
+			if ( file_exists( $tmp_ext . '/.extraction_complete' ) ) {
 				return $tmp_ext;
 			}
-			// Directory exists but is empty — clean up and re-download.
+			// Incomplete extraction from a previous run — clean up and re-download.
 			self::cleanup_temp_dir( $tmp_ext );
 		}
 
@@ -558,6 +543,9 @@ class CodeChaff {
 			return $extracted;
 		}
 
+		// Mark extraction as complete so it can be safely reused.
+		@file_put_contents( $tmp_ext . '/.extraction_complete', '' );
+
 		return $tmp_ext;
 	}
 
@@ -576,6 +564,7 @@ class CodeChaff {
 			if ( \is_wp_error( $result ) ) {
 				return $result;
 			}
+			self::fix_extracted_permissions( $dest_dir );
 			return true;
 		}
 
@@ -592,6 +581,10 @@ class CodeChaff {
 		$zip->extractTo( $dest_dir );
 		$zip->close();
 
+		// Fix permissions inherited from the ZIP archive to ensure
+		// all directories are traversable and all files are readable/deletable.
+		self::fix_extracted_permissions( $dest_dir );
+
 		// Handle nested WordPress plugin folder.
 		$entries = scandir( $dest_dir );
 		$entries = array_diff( (array) $entries, array( '.', '..' ) );
@@ -607,11 +600,47 @@ class CodeChaff {
 					}
 					rename( $inner . '/' . $f, $dest_dir . '/' . $f );
 				}
-				rmdir( $inner );
+				@rmdir( $inner );
 			}
 		}
 
 		return true;
+	}
+
+	/**
+	 * Recursively fix permissions on an extracted directory.
+	 *
+	 * ZIP archives can store restrictive permissions that prevent reading
+	 * or deleting extracted files. This ensures all directories are
+	 * traversable (0755) and all files are readable (0644).
+	 *
+	 * @param string $dir Directory path.
+	 * @return void
+	 */
+	private static function fix_extracted_permissions( $dir ) {
+		if ( ! is_dir( $dir ) ) {
+			return;
+		}
+
+		@chmod( $dir, 0755 );
+
+		$entries = @scandir( $dir );
+		if ( ! is_array( $entries ) ) {
+			return;
+		}
+
+		foreach ( $entries as $entry ) {
+			if ( '.' === $entry || '..' === $entry ) {
+				continue;
+			}
+			$path = $dir . '/' . $entry;
+			if ( is_dir( $path ) ) {
+				// chmod BEFORE recursing — so we can enter it.
+				self::fix_extracted_permissions( $path );
+			} else {
+				@chmod( $path, 0644 );
+			}
+		}
 	}
 
 	/**
@@ -631,7 +660,9 @@ class CodeChaff {
 			new \RecursiveDirectoryIterator(
 				$dir,
 				\FilesystemIterator::KEY_AS_PATHNAME | \FilesystemIterator::CURRENT_AS_FILEINFO | \FilesystemIterator::SKIP_DOTS
-			)
+			),
+			\RecursiveIteratorIterator::LEAVES_ONLY,
+			\RecursiveIteratorIterator::CATCH_GET_CHILD
 		);
 
 		try {
@@ -799,6 +830,13 @@ class CodeChaff {
 	 * @return void
 	 */
 	public static function run_audit( $args ) {
+		// Action Scheduler wraps args in a numeric array. Unwrap.
+		if ( is_array( $args ) && isset( $args[0] ) && is_array( $args[0] ) ) {
+			$args = $args[0];
+		}
+
+		error_log( print_r( $args, true ) );
+
 		// Allow long-running audits.
 		set_time_limit( 300 );
 
@@ -808,6 +846,9 @@ class CodeChaff {
 		$new_ver   = $args['new_ver'] ?? '';
 
 		if ( ! $slug || ! $new_ver ) {
+			error_log($slug);
+			error_log($new_ver);
+			error_log('RETURNED');
 			return;
 		}
 
@@ -818,6 +859,7 @@ class CodeChaff {
 		}
 
 		// Phase 1: Download and diff.
+		error_log( '[CodeChaff Debug] Starting audit: ' . $slug . ' ' . $old_ver . '→' . $new_ver );
 		$changed_files = self::fetch_changed_files( $slug, $item_type, $old_ver, $new_ver );
 
 		if ( \is_wp_error( $changed_files ) ) {
@@ -889,6 +931,8 @@ class CodeChaff {
 			),
 			'triage'  => array(),
 		);
+
+		error_log( '[CodeChaff Debug] Scanner completed. Changed files: ' . count( $changed_files ) . ', findings: ' . count( $all_findings ) );
 
 		// Phase 3: AI triage of scanner findings (if any).
 		if ( ! empty( $all_findings ) ) {
@@ -975,10 +1019,12 @@ class CodeChaff {
 		// Compute risk level from triage verdicts.
 		$risk = self::compute_triage_risk_level( $report );
 
+		error_log( '[CodeChaff Debug] Risk computed: ' . $risk . ', report size: ' . strlen( wp_json_encode( $report ) ) . ' bytes' );
+
 		global $wpdb;
 		$table = $wpdb->prefix . 'code_chaff_audits';
 
-		$wpdb->insert(
+		$inserted = $wpdb->insert(
 			$table,
 			array(
 				'slug'         => $slug,
@@ -991,6 +1037,12 @@ class CodeChaff {
 			),
 			array( '%s', '%s', '%s', '%s', '%s', '%s', '%s' )
 		);
+
+		if ( false === $inserted ) {
+			error_log( '[CodeChaff Debug] DB insert FAILED: ' . $wpdb->last_error );
+		} else {
+			error_log( '[CodeChaff Debug] DB insert OK, rows: ' . $inserted );
+		}
 	}
 
 	/**
